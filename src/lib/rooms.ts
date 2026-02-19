@@ -1,5 +1,4 @@
 import {
-  collection,
   doc,
   getDoc,
   getDocs,
@@ -7,9 +6,10 @@ import {
   orderBy,
   query,
   runTransaction,
+  setDoc,
   serverTimestamp,
   updateDoc,
-  where,
+  collection,
 } from "firebase/firestore";
 import { auth, db } from "./firebase";
 
@@ -27,12 +27,17 @@ export type RoomPlayer = {
   id: string;
   name: string;
   isHost: boolean;
+  isReady?: boolean;
   joinedAt?: unknown;
 };
 
 export type RoomData = RoomSummary & {
   waitingSince?: unknown;
+  lastActiveAt?: unknown;
 };
+
+const MAIN_ROOM_ID = "main";
+const MAX_ROOM_PLAYERS = 15;
 
 const requireUid = () => {
   const uid = auth.currentUser?.uid;
@@ -42,6 +47,18 @@ const requireUid = () => {
   return uid;
 };
 
+export const upsertUserProfile = async (displayName: string) => {
+  const uid = requireUid();
+  const userRef = doc(db, "users", uid);
+  await setDoc(
+    userRef,
+    {
+      displayName,
+    },
+    { merge: true },
+  );
+};
+
 export const getActiveRoomId = async () => {
   const uid = requireUid();
   const userSnap = await getDoc(doc(db, "users", uid));
@@ -49,25 +66,6 @@ export const getActiveRoomId = async () => {
     return null;
   }
   return (userSnap.data().activeRoomId as string | null) ?? null;
-};
-
-export const listenRoomsWaiting = (
-  onRooms: (rooms: RoomSummary[]) => void,
-) => {
-  const roomsRef = collection(db, "rooms");
-  const waitingQuery = query(
-    roomsRef,
-    where("state", "==", "waiting"),
-    orderBy("createdAt", "desc"),
-  );
-
-  return onSnapshot(waitingQuery, (snapshot) => {
-    const rooms = snapshot.docs.map((docSnap) => {
-      const data = docSnap.data() as Omit<RoomSummary, "id">;
-      return { id: docSnap.id, ...data };
-    });
-    onRooms(rooms);
-  });
 };
 
 export const listenRoom = (roomId: string, onRoom: (room: RoomData | null) => void) => {
@@ -98,93 +96,94 @@ export const listenRoomPlayers = (
   });
 };
 
-export const createRoom = async (displayName: string) => {
+export const touchPlayer = async (roomId: string) => {
   const uid = requireUid();
-  const roomsRef = collection(db, "rooms");
-  const roomRef = doc(roomsRef);
-  const userRef = doc(db, "users", uid);
-  const playerRef = doc(db, "rooms", roomRef.id, "players", uid);
-
-  return runTransaction(db, async (tx) => {
-    const userSnap = await tx.get(userRef);
-    if (userSnap.exists() && userSnap.data().activeRoomId) {
-      throw new Error("You are already in a room.");
-    }
-
-    tx.set(roomRef, {
-      hostUid: uid,
-      state: "waiting",
-      createdAt: serverTimestamp(),
-      lastActiveAt: serverTimestamp(),
-      playerCount: 1,
-      waitingSince: serverTimestamp(),
-    });
-
-    tx.set(playerRef, {
-      name: displayName,
-      isHost: true,
-      joinedAt: serverTimestamp(),
-      lastSeenAt: serverTimestamp(),
-    });
-
-    tx.set(
-      userRef,
-      {
-        displayName,
-        activeRoomId: roomRef.id,
-      },
-      { merge: true },
-    );
-
-    return { roomId: roomRef.id, isHost: true };
+  const playerRef = doc(db, "rooms", roomId, "players", uid);
+  await updateDoc(playerRef, {
+    lastSeenAt: serverTimestamp(),
   });
 };
 
-export const joinRoom = async (roomId: string, displayName: string) => {
+export const joinMainRoom = async (displayName: string) => {
   const uid = requireUid();
-  const roomRef = doc(db, "rooms", roomId);
+  const roomRef = doc(db, "rooms", MAIN_ROOM_ID);
   const userRef = doc(db, "users", uid);
-  const playerRef = doc(db, "rooms", roomId, "players", uid);
+  const playerRef = doc(db, "rooms", MAIN_ROOM_ID, "players", uid);
 
   return runTransaction(db, async (tx) => {
-    const roomSnap = await tx.get(roomRef);
-    if (!roomSnap.exists()) {
-      throw new Error("Room no longer exists.");
-    }
-    const roomData = roomSnap.data() as RoomData;
-    if (roomData.state !== "waiting") {
-      throw new Error("Room is no longer accepting players.");
-    }
-
     const userSnap = await tx.get(userRef);
-    if (userSnap.exists() && userSnap.data().activeRoomId) {
+    const activeRoomId = (userSnap.data()?.activeRoomId as string | null) ?? null;
+    if (activeRoomId && activeRoomId !== MAIN_ROOM_ID) {
       throw new Error("You are already in a room.");
     }
 
-    tx.set(playerRef, {
-      name: displayName,
-      isHost: false,
-      joinedAt: serverTimestamp(),
-      lastSeenAt: serverTimestamp(),
-    });
+    const roomSnap = await tx.get(roomRef);
+    const playerSnap = await tx.get(playerRef);
+    let isHost = false;
 
-    const nextCount = (roomData.playerCount ?? 0) + 1;
-    tx.update(roomRef, {
-      playerCount: nextCount,
-      lastActiveAt: serverTimestamp(),
-      waitingSince: nextCount <= 1 ? serverTimestamp() : null,
-    });
+    if (!roomSnap.exists()) {
+      isHost = true;
+      tx.set(roomRef, {
+        hostUid: uid,
+        state: "waiting",
+        createdAt: serverTimestamp(),
+        lastActiveAt: serverTimestamp(),
+        playerCount: 1,
+        waitingSince: serverTimestamp(),
+      });
+      tx.set(playerRef, {
+        name: displayName,
+        isHost: true,
+        isReady: false,
+        joinedAt: serverTimestamp(),
+        lastSeenAt: serverTimestamp(),
+      });
+    } else {
+      const roomData = roomSnap.data() as RoomData;
+      if (roomData.state !== "waiting") {
+        throw new Error("Game already started.");
+      }
+
+      isHost = roomData.hostUid === uid;
+      if (!playerSnap.exists()) {
+        const currentCount = roomData.playerCount ?? 0;
+        if (currentCount >= MAX_ROOM_PLAYERS) {
+          throw new Error("Room is full (15 players max).");
+        }
+        tx.set(playerRef, {
+          name: displayName,
+          isHost,
+          isReady: false,
+          joinedAt: serverTimestamp(),
+          lastSeenAt: serverTimestamp(),
+        });
+        tx.update(roomRef, {
+          playerCount: currentCount + 1,
+          lastActiveAt: serverTimestamp(),
+          waitingSince: currentCount + 1 <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
+        });
+      } else {
+        tx.set(
+          playerRef,
+          {
+            name: displayName,
+            lastSeenAt: serverTimestamp(),
+          },
+          { merge: true },
+        );
+      }
+    }
 
     tx.set(
       userRef,
       {
         displayName,
-        activeRoomId: roomId,
+        activeRoomId: MAIN_ROOM_ID,
       },
       { merge: true },
     );
 
-    return { roomId, isHost: false };
+    return { roomId: MAIN_ROOM_ID, isHost };
   });
 };
 
@@ -193,27 +192,40 @@ export const leaveRoom = async (roomId: string) => {
   const roomRef = doc(db, "rooms", roomId);
   const playerRef = doc(db, "rooms", roomId, "players", uid);
   const userRef = doc(db, "users", uid);
+  const playersRef = collection(db, "rooms", roomId, "players");
+  const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
+  const nextHostDoc = playersSnap.docs.find((docSnap) => docSnap.id !== uid) ?? null;
 
   return runTransaction(db, async (tx) => {
     const roomSnap = await tx.get(roomRef);
     if (roomSnap.exists()) {
       const roomData = roomSnap.data() as RoomData;
       const nextCount = Math.max((roomData.playerCount ?? 1) - 1, 0);
-      tx.update(roomRef, {
+      const updates: Partial<RoomData> = {
         playerCount: nextCount,
         lastActiveAt: serverTimestamp(),
         waitingSince: nextCount <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
-      });
+      };
+      if (nextCount > 0 && roomData.hostUid === uid && nextHostDoc) {
+        updates.hostUid = nextHostDoc.id;
+      }
+      tx.update(roomRef, updates);
+      if (nextCount > 0 && roomData.hostUid === uid && nextHostDoc) {
+        tx.update(nextHostDoc.ref, { isHost: true });
+      }
     }
 
     tx.delete(playerRef);
-    tx.set(
-      userRef,
-      {
-        activeRoomId: null,
-      },
-      { merge: true },
-    );
+    const userSnap = await tx.get(userRef);
+    if (userSnap.exists()) {
+      tx.set(
+        userRef,
+        {
+          activeRoomId: null,
+        },
+        { merge: true },
+      );
+    }
   });
 };
 
@@ -253,6 +265,15 @@ export const kickPlayer = async (roomId: string, playerUid: string) => {
   });
 };
 
+export const setPlayerReady = async (roomId: string, isReady: boolean) => {
+  const uid = requireUid();
+  const playerRef = doc(db, "rooms", roomId, "players", uid);
+  await updateDoc(playerRef, {
+    isReady,
+    lastSeenAt: serverTimestamp(),
+  });
+};
+
 export const startGame = async (roomId: string) => {
   const uid = requireUid();
   const roomRef = doc(db, "rooms", roomId);
@@ -263,22 +284,17 @@ export const startGame = async (roomId: string) => {
   if ((roomSnap.data() as RoomData).hostUid !== uid) {
     throw new Error("Only the host can start the game.");
   }
+  const playersRef = collection(db, "rooms", roomId, "players");
+  const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
+  if (playersSnap.empty) {
+    throw new Error("Need at least one player.");
+  }
+  const everyoneReady = playersSnap.docs.every((docSnap) => docSnap.data().isReady === true);
+  if (!everyoneReady) {
+    throw new Error("All players must be ready first.");
+  }
   await updateDoc(roomRef, {
     state: "playing",
     lastActiveAt: serverTimestamp(),
-  });
-};
-
-export const listRoomsWaitingOnce = async () => {
-  const roomsRef = collection(db, "rooms");
-  const waitingQuery = query(
-    roomsRef,
-    where("state", "==", "waiting"),
-    orderBy("createdAt", "desc"),
-  );
-  const snapshot = await getDocs(waitingQuery);
-  return snapshot.docs.map((docSnap) => {
-    const data = docSnap.data() as Omit<RoomSummary, "id">;
-    return { id: docSnap.id, ...data };
   });
 };

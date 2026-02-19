@@ -1,6 +1,7 @@
 {
   "projects": {
-    "staging": "marcophoto-9cb75"
+    "staging": "marcophoto-9cb75",
+    "default": "marcophoto-9cb75"
   },
   "targets": {},
   "etags": {}

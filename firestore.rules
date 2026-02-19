@@ -5,38 +5,79 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function hasProfile() {
+      return isSignedIn()
+        && (
+          (
+            exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName is string
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName.size() > 0
+          ) || (
+            existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName is string
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName.size() > 0
+          )
+        );
+    }
+
     function isHost(roomId) {
-      return isSignedIn() &&
-        request.auth.uid == get(/databases/$(database)/documents/rooms/$(roomId)).data.hostUid;
+      return hasProfile()
+        && request.auth.uid == get(/databases/$(database)/documents/rooms/$(roomId)).data.hostUid;
     }
 
     match /users/{userId} {
-      allow read, create, update: if isSignedIn() && request.auth.uid == userId;
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() > 0;
+      allow update: if isSignedIn()
+        && request.auth.uid == userId
+        && (
+          (
+            request.resource.data.displayName is string
+            && request.resource.data.displayName.size() > 0
+          ) || (
+            request.resource.data.diff(resource.data).changedKeys().hasOnly(["activeRoomId"])
+          )
+        );
     }
 
     match /rooms/{roomId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn()
+      allow read: if hasProfile();
+      allow create: if hasProfile()
         && request.auth.uid == request.resource.data.hostUid
         && (
           !exists(/databases/$(database)/documents/stats/rooms) ||
           get(/databases/$(database)/documents/stats/rooms).data.count < 15
         );
-      allow update: if isSignedIn()
-        && request.resource.data.hostUid == resource.data.hostUid
+      allow update: if hasProfile()
         && request.resource.data.createdAt == resource.data.createdAt
         && request.resource.data.state in ["waiting", "playing"]
         && (
-          request.auth.uid == resource.data.hostUid ||
-          request.resource.data.diff(resource.data).changedKeys()
-            .hasOnly(["playerCount", "lastActiveAt", "waitingSince"])
+          (
+            request.auth.uid == resource.data.hostUid
+            && request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["playerCount", "lastActiveAt", "waitingSince", "hostUid", "state"])
+          ) || (
+            request.auth.uid != resource.data.hostUid
+            && request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["playerCount", "lastActiveAt", "waitingSince"])
+          )
         );
       allow delete: if false;
 
       match /players/{playerId} {
-        allow read: if isSignedIn();
-        allow create, update: if isSignedIn() && request.auth.uid == playerId;
-        allow delete: if isSignedIn() && (request.auth.uid == playerId || isHost(roomId));
+        allow read: if hasProfile();
+        allow create, update: if hasProfile()
+          && (
+            request.auth.uid == playerId
+            || (
+              isHost(roomId)
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["isHost"])
+            )
+          );
+        allow delete: if hasProfile() && (request.auth.uid == playerId || isHost(roomId));
       }
     }
 
