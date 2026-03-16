@@ -17,18 +17,21 @@ export type RoomState = "waiting" | "playing";
 
 export type RoomSummary = {
   id: string;
-  hostUid: string;
   state: RoomState;
   playerCount: number;
   createdAt?: unknown;
+  marcoCount?: number;
+  rounds?: number;
+  photosPerPlayer?: number;
 };
 
 export type RoomPlayer = {
   id: string;
   name: string;
-  isHost: boolean;
   isReady?: boolean;
+  votekickCount?: number;
   joinedAt?: unknown;
+  role?: "Marco" | "Reg";
 };
 
 export type RoomData = RoomSummary & {
@@ -36,8 +39,16 @@ export type RoomData = RoomSummary & {
   lastActiveAt?: unknown;
 };
 
+export const getGameConfig = (playerCount: number) => {
+  if (playerCount >= 16) return { marcoCount: 4, rounds: 12, photosPerPlayer: 24 };
+  if (playerCount >= 12) return { marcoCount: 3, rounds: 9, photosPerPlayer: 18 };
+  if (playerCount >= 8) return { marcoCount: 2, rounds: 6, photosPerPlayer: 12 };
+  return { marcoCount: 1, rounds: 3, photosPerPlayer: 6 };
+};
+
 const MAIN_ROOM_ID = "main";
-const MAX_ROOM_PLAYERS = 15;
+const MAX_ROOM_PLAYERS = 19;
+const VOTE_KICK_MIN_THRESHOLD = 2;
 
 const requireUid = () => {
   const uid = auth.currentUser?.uid;
@@ -119,12 +130,8 @@ export const joinMainRoom = async (displayName: string) => {
 
     const roomSnap = await tx.get(roomRef);
     const playerSnap = await tx.get(playerRef);
-    let isHost = false;
-
     if (!roomSnap.exists()) {
-      isHost = true;
       tx.set(roomRef, {
-        hostUid: uid,
         state: "waiting",
         createdAt: serverTimestamp(),
         lastActiveAt: serverTimestamp(),
@@ -133,35 +140,39 @@ export const joinMainRoom = async (displayName: string) => {
       });
       tx.set(playerRef, {
         name: displayName,
-        isHost: true,
         isReady: false,
+        votekickCount: 0,
         joinedAt: serverTimestamp(),
         lastSeenAt: serverTimestamp(),
       });
     } else {
       const roomData = roomSnap.data() as RoomData;
-      if (roomData.state !== "waiting") {
+      const currentCount = roomData.playerCount ?? 0;
+      const shouldResetRoom = currentCount < 2;
+      if (roomData.state !== "waiting" && !shouldResetRoom) {
         throw new Error("Game already started.");
       }
 
-      isHost = roomData.hostUid === uid;
       if (!playerSnap.exists()) {
-        const currentCount = roomData.playerCount ?? 0;
         if (currentCount >= MAX_ROOM_PLAYERS) {
           throw new Error("Room is full (15 players max).");
         }
         tx.set(playerRef, {
           name: displayName,
-          isHost,
           isReady: false,
+          votekickCount: 0,
           joinedAt: serverTimestamp(),
           lastSeenAt: serverTimestamp(),
         });
-        tx.update(roomRef, {
+        const roomUpdates: Record<string, unknown> = {
           playerCount: currentCount + 1,
           lastActiveAt: serverTimestamp(),
           waitingSince: currentCount + 1 <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
-        });
+        };
+        if (shouldResetRoom) {
+          roomUpdates.state = "waiting";
+        }
+        tx.update(roomRef, roomUpdates);
       } else {
         tx.set(
           playerRef,
@@ -171,6 +182,13 @@ export const joinMainRoom = async (displayName: string) => {
           },
           { merge: true },
         );
+        if (shouldResetRoom && roomData.state !== "waiting") {
+          tx.update(roomRef, {
+            state: "waiting",
+            lastActiveAt: serverTimestamp(),
+            waitingSince: serverTimestamp(),
+          });
+        }
       }
     }
 
@@ -183,7 +201,7 @@ export const joinMainRoom = async (displayName: string) => {
       { merge: true },
     );
 
-    return { roomId: MAIN_ROOM_ID, isHost };
+    return { roomId: MAIN_ROOM_ID };
   });
 };
 
@@ -192,9 +210,6 @@ export const leaveRoom = async (roomId: string) => {
   const roomRef = doc(db, "rooms", roomId);
   const playerRef = doc(db, "rooms", roomId, "players", uid);
   const userRef = doc(db, "users", uid);
-  const playersRef = collection(db, "rooms", roomId, "players");
-  const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
-  const nextHostDoc = playersSnap.docs.find((docSnap) => docSnap.id !== uid) ?? null;
 
   return runTransaction(db, async (tx) => {
     const roomSnap = await tx.get(roomRef);
@@ -206,62 +221,95 @@ export const leaveRoom = async (roomId: string) => {
         lastActiveAt: serverTimestamp(),
         waitingSince: nextCount <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
       };
-      if (nextCount > 0 && roomData.hostUid === uid && nextHostDoc) {
-        updates.hostUid = nextHostDoc.id;
+      if (nextCount < 2) {
+        updates.state = "waiting";
       }
       tx.update(roomRef, updates);
-      if (nextCount > 0 && roomData.hostUid === uid && nextHostDoc) {
-        tx.update(nextHostDoc.ref, { isHost: true });
-      }
     }
 
     tx.delete(playerRef);
-    const userSnap = await tx.get(userRef);
-    if (userSnap.exists()) {
-      tx.set(
-        userRef,
-        {
-          activeRoomId: null,
-        },
-        { merge: true },
-      );
-    }
+    tx.set(
+      userRef,
+      {
+        activeRoomId: null,
+      },
+      { merge: true },
+    );
   });
 };
 
-export const kickPlayer = async (roomId: string, playerUid: string) => {
+export const voteKickPlayer = async (roomId: string, targetPlayerUid: string) => {
   const uid = requireUid();
+  if (uid === targetPlayerUid) {
+    throw new Error("You cannot vote kick yourself.");
+  }
+
   const roomRef = doc(db, "rooms", roomId);
-  const playerRef = doc(db, "rooms", roomId, "players", playerUid);
-  const playerUserRef = doc(db, "users", playerUid);
+  const playersRef = collection(db, "rooms", roomId, "players");
+  const voterPlayerRef = doc(playersRef, uid);
+  const targetPlayerRef = doc(playersRef, targetPlayerUid);
+  const targetVoteRef = doc(db, "rooms", roomId, "players", targetPlayerUid, "votes", uid);
+  const targetUserRef = doc(db, "users", targetPlayerUid);
 
   return runTransaction(db, async (tx) => {
     const roomSnap = await tx.get(roomRef);
     if (!roomSnap.exists()) {
       throw new Error("Room not found.");
     }
-    const roomData = roomSnap.data() as RoomData;
-    if (roomData.hostUid !== uid) {
-      throw new Error("Only the host can kick players.");
+    const voterPlayerSnap = await tx.get(voterPlayerRef);
+    if (!voterPlayerSnap.exists()) {
+      throw new Error("You are not in this room.");
     }
-    if (playerUid === uid) {
-      throw new Error("Host cannot kick themselves.");
+    const targetPlayerSnap = await tx.get(targetPlayerRef);
+    if (!targetPlayerSnap.exists()) {
+      throw new Error("Player is no longer in this room.");
+    }
+    const existingVoteSnap = await tx.get(targetVoteRef);
+    if (existingVoteSnap.exists()) {
+      throw new Error("You already voted to kick this player.");
     }
 
-    const nextCount = Math.max((roomData.playerCount ?? 1) - 1, 0);
-    tx.update(roomRef, {
+    const roomData = roomSnap.data() as RoomData;
+    const targetPlayerData = targetPlayerSnap.data() as RoomPlayer;
+    const currentCount = roomData.playerCount ?? 0;
+    const nextVoteCount = (targetPlayerData.votekickCount ?? 0) + 1;
+    const votesNeeded = Math.max(
+      VOTE_KICK_MIN_THRESHOLD,
+      Math.ceil((currentCount - 1) / 2),
+    );
+
+    tx.set(targetVoteRef, {
+      voterUid: uid,
+      createdAt: serverTimestamp(),
+    });
+
+    if (nextVoteCount < votesNeeded) {
+      tx.update(targetPlayerRef, { votekickCount: nextVoteCount });
+      return { kicked: false, voteCount: nextVoteCount, votesNeeded };
+    }
+
+    const nextCount = Math.max(currentCount - 1, 0);
+    const roomUpdates: Partial<RoomData> & { state?: RoomState } = {
       playerCount: nextCount,
       lastActiveAt: serverTimestamp(),
       waitingSince: nextCount <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
-    });
-    tx.delete(playerRef);
+    };
+
+    if (nextCount < 2) {
+      roomUpdates.state = "waiting";
+    }
+
+    tx.update(roomRef, roomUpdates);
+    tx.delete(targetPlayerRef);
     tx.set(
-      playerUserRef,
+      targetUserRef,
       {
         activeRoomId: null,
       },
       { merge: true },
     );
+
+    return { kicked: true, voteCount: nextVoteCount, votesNeeded };
   });
 };
 
@@ -274,27 +322,48 @@ export const setPlayerReady = async (roomId: string, isReady: boolean) => {
   });
 };
 
+const fisherYatesShuffle = <T>(arr: T[]): T[] => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+
 export const startGame = async (roomId: string) => {
-  const uid = requireUid();
+  requireUid();
   const roomRef = doc(db, "rooms", roomId);
-  const roomSnap = await getDoc(roomRef);
-  if (!roomSnap.exists()) {
-    throw new Error("Room not found.");
-  }
-  if ((roomSnap.data() as RoomData).hostUid !== uid) {
-    throw new Error("Only the host can start the game.");
-  }
   const playersRef = collection(db, "rooms", roomId, "players");
-  const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
-  if (playersSnap.empty) {
-    throw new Error("Need at least one player.");
-  }
-  const everyoneReady = playersSnap.docs.every((docSnap) => docSnap.data().isReady === true);
-  if (!everyoneReady) {
-    throw new Error("All players must be ready first.");
-  }
-  await updateDoc(roomRef, {
-    state: "playing",
-    lastActiveAt: serverTimestamp(),
+
+  return runTransaction(db, async (tx) => {
+    const roomSnap = await tx.get(roomRef);
+    if (!roomSnap.exists()) {
+      throw new Error("Room not found.");
+    }
+    const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
+    if (playersSnap.size < 2) {
+      throw new Error("Need at least two players.");
+    }
+    const everyoneReady = playersSnap.docs.every((d) => d.data().isReady === true);
+    if (!everyoneReady) {
+      throw new Error("All players must be ready first.");
+    }
+
+    const { marcoCount, rounds, photosPerPlayer } = getGameConfig(playersSnap.size);
+    const shuffledIds = fisherYatesShuffle(playersSnap.docs.map((d) => d.id));
+
+    for (let i = 0; i < shuffledIds.length; i++) {
+      const playerRef = doc(db, "rooms", roomId, "players", shuffledIds[i]);
+      tx.update(playerRef, { role: i < marcoCount ? "Marco" : "Reg" });
+    }
+
+    tx.update(roomRef, {
+      state: "playing",
+      marcoCount,
+      rounds,
+      photosPerPlayer,
+      lastActiveAt: serverTimestamp(),
+    });
   });
 };

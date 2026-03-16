@@ -20,9 +20,19 @@ service cloud.firestore {
         );
     }
 
-    function isHost(roomId) {
-      return hasProfile()
-        && request.auth.uid == get(/databases/$(database)/documents/rooms/$(roomId)).data.hostUid;
+    function canClearRemovedPlayerActiveRoom(userId) {
+      return request.auth.uid != userId
+        && resource.data.activeRoomId is string
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["activeRoomId"])
+        && request.resource.data.activeRoomId == null
+        && !existsAfter(/databases/$(database)/documents/rooms/$(resource.data.activeRoomId)/players/$(userId));
+    }
+
+    function roomAfterWithinCapacity() {
+      return existsAfter(/databases/$(database)/documents/rooms/main)
+        && getAfter(/databases/$(database)/documents/rooms/main).data.playerCount is int
+        && getAfter(/databases/$(database)/documents/rooms/main).data.playerCount >= 0
+        && getAfter(/databases/$(database)/documents/rooms/main).data.playerCount <= 19;
     }
 
     match /users/{userId} {
@@ -32,52 +42,91 @@ service cloud.firestore {
         && request.resource.data.displayName is string
         && request.resource.data.displayName.size() > 0;
       allow update: if isSignedIn()
-        && request.auth.uid == userId
         && (
           (
-            request.resource.data.displayName is string
-            && request.resource.data.displayName.size() > 0
-          ) || (
-            request.resource.data.diff(resource.data).changedKeys().hasOnly(["activeRoomId"])
-          )
+            request.auth.uid == userId
+            && (
+              (
+                request.resource.data.displayName is string
+                && request.resource.data.displayName.size() > 0
+              ) || (
+                request.resource.data.diff(resource.data).changedKeys().hasOnly(["activeRoomId"])
+              )
+            )
+          ) || canClearRemovedPlayerActiveRoom(userId)
         );
     }
 
     match /rooms/{roomId} {
-      allow read: if hasProfile();
-      allow create: if hasProfile()
-        && request.auth.uid == request.resource.data.hostUid
-        && (
-          !exists(/databases/$(database)/documents/stats/rooms) ||
-          get(/databases/$(database)/documents/stats/rooms).data.count < 15
-        );
-      allow update: if hasProfile()
+      allow read: if isSignedIn() && roomId == "main";
+      allow create: if isSignedIn() && roomId == "main";
+      allow update: if isSignedIn()
+        && roomId == "main"
+        && roomAfterWithinCapacity()
         && request.resource.data.createdAt == resource.data.createdAt
         && request.resource.data.state in ["waiting", "playing"]
-        && (
-          (
-            request.auth.uid == resource.data.hostUid
-            && request.resource.data.diff(resource.data).changedKeys()
-              .hasOnly(["playerCount", "lastActiveAt", "waitingSince", "hostUid", "state"])
-          ) || (
-            request.auth.uid != resource.data.hostUid
-            && request.resource.data.diff(resource.data).changedKeys()
-              .hasOnly(["playerCount", "lastActiveAt", "waitingSince"])
-          )
-        );
+        && !request.resource.data.keys().hasAny(["hostUid"])
+        && request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(["playerCount", "lastActiveAt", "waitingSince", "state",
+                    "marcoCount", "rounds", "photosPerPlayer"]);
       allow delete: if false;
 
       match /players/{playerId} {
-        allow read: if hasProfile();
-        allow create, update: if hasProfile()
+        allow read: if isSignedIn() && roomId == "main";
+        allow create: if isSignedIn()
+          && roomId == "main"
+          && request.auth.uid == playerId
+          && request.resource.data.keys().hasOnly(["name", "isReady", "votekickCount", "joinedAt", "lastSeenAt"])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.isReady is bool
+          && request.resource.data.votekickCount is int
+          && request.resource.data.votekickCount == 0
+          && roomAfterWithinCapacity();
+        allow update: if isSignedIn()
+          && roomId == "main"
+          && (
+            (
+              request.auth.uid == playerId
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["name", "isReady", "lastSeenAt"])
+              && request.resource.data.name is string
+              && request.resource.data.name.size() > 0
+              && request.resource.data.isReady is bool
+            )
+            || (
+              request.auth.uid != playerId
+              && roomAfterWithinCapacity()
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["votekickCount"])
+              && request.resource.data.votekickCount is int
+              && request.resource.data.votekickCount == ((resource.data.votekickCount is int ? resource.data.votekickCount : 0) + 1)
+              && existsAfter(/databases/$(database)/documents/rooms/$(roomId)/players/$(playerId)/votes/$(request.auth.uid))
+            )
+            || (
+              request.resource.data.diff(resource.data).changedKeys().hasOnly(["role"])
+              && request.resource.data.role in ["Marco", "Reg"]
+              && getAfter(/databases/$(database)/documents/rooms/main).data.state == "playing"
+            )
+          );
+        allow delete: if isSignedIn()
+          && roomId == "main"
           && (
             request.auth.uid == playerId
             || (
-              isHost(roomId)
-              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["isHost"])
+              request.auth.uid != playerId
+              && resource.data.votekickCount is int
+              && resource.data.votekickCount >= 2
+              && existsAfter(/databases/$(database)/documents/rooms/$(roomId)/players/$(playerId)/votes/$(request.auth.uid))
             )
           );
-        allow delete: if hasProfile() && (request.auth.uid == playerId || isHost(roomId));
+
+        match /votes/{voterUid} {
+          allow read: if isSignedIn() && roomId == "main";
+          allow create: if isSignedIn()
+            && roomId == "main"
+            && request.auth.uid == voterUid
+            && request.resource.data.voterUid == request.auth.uid;
+          allow update, delete: if false;
+        }
       }
     }
 

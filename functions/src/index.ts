@@ -6,7 +6,9 @@ import { onSchedule } from "firebase-functions/v2/scheduler";
 initializeApp();
 
 const db = getFirestore();
+const MAIN_ROOM_ID = "main";
 const PRESENCE_TIMEOUT_MS = 30 * 1000;
+const WAITING_PLAYER_TIMEOUT_MS = 10 * 60 * 1000;
 
 export const onRoomCreated = onDocumentCreated("rooms/{roomId}", async () => {
   await db.doc("stats/rooms").set(
@@ -29,7 +31,21 @@ export const onRoomDeleted = onDocumentDeleted("rooms/{roomId}", async () => {
 });
 
 export const cleanupRooms = onSchedule("every 1 minutes", async () => {
-  const cutoff = Timestamp.fromDate(new Date(Date.now() - PRESENCE_TIMEOUT_MS));
+  const presenceCutoff = Timestamp.fromDate(new Date(Date.now() - PRESENCE_TIMEOUT_MS));
+  const waitingPlayerCutoff = Timestamp.fromDate(
+    new Date(Date.now() - WAITING_PLAYER_TIMEOUT_MS),
+  );
+  const mainRoomRef = db.collection("rooms").doc(MAIN_ROOM_ID);
+  const mainRoomSnap = await mainRoomRef.get();
+  if (!mainRoomSnap.exists) {
+    await mainRoomRef.set({
+      state: "waiting",
+      createdAt: FieldValue.serverTimestamp(),
+      lastActiveAt: FieldValue.serverTimestamp(),
+      playerCount: 0,
+      waitingSince: FieldValue.serverTimestamp(),
+    });
+  }
   const roomsSnap = await db.collection("rooms").get();
 
   if (roomsSnap.empty) {
@@ -38,24 +54,40 @@ export const cleanupRooms = onSchedule("every 1 minutes", async () => {
 
   for (const roomDoc of roomsSnap.docs) {
     const roomData = roomDoc.data() as {
-      hostUid?: string;
       playerCount?: number;
       waitingSince?: Timestamp | null;
+      state?: string;
+      hostUid?: unknown;
     };
     const playersSnap = await roomDoc.ref
       .collection("players")
       .orderBy("joinedAt", "asc")
       .get();
+    const roomIsWaiting = roomData.state !== "playing";
     const batch = db.batch();
     let hasWrites = false;
 
+    if (Object.prototype.hasOwnProperty.call(roomData, "hostUid")) {
+      batch.update(roomDoc.ref, { hostUid: FieldValue.delete() });
+      hasWrites = true;
+    }
+
     const remainingPlayers: FirebaseFirestore.QueryDocumentSnapshot[] = [];
     for (const playerDoc of playersSnap.docs) {
-      const playerData = playerDoc.data() as { lastSeenAt?: Timestamp };
+      const playerData = playerDoc.data() as {
+        lastSeenAt?: Timestamp;
+        joinedAt?: Timestamp;
+      };
       const lastSeenAt = playerData.lastSeenAt;
-      const isStale =
-        !lastSeenAt || lastSeenAt.toMillis() <= cutoff.toMillis();
-      if (isStale) {
+      const joinedAt = playerData.joinedAt;
+      const isStalePresence =
+        !lastSeenAt || lastSeenAt.toMillis() <= presenceCutoff.toMillis();
+      const isWaitingTimeout =
+        roomIsWaiting &&
+        !!joinedAt &&
+        joinedAt.toMillis() <= waitingPlayerCutoff.toMillis();
+
+      if (isStalePresence || isWaitingTimeout) {
         batch.delete(playerDoc.ref);
         batch.set(
           db.doc(`users/${playerDoc.id}`),
@@ -64,42 +96,32 @@ export const cleanupRooms = onSchedule("every 1 minutes", async () => {
         );
         hasWrites = true;
       } else {
+        if (Object.prototype.hasOwnProperty.call(playerData, "isHost")) {
+          batch.update(playerDoc.ref, { isHost: FieldValue.delete() });
+          hasWrites = true;
+        }
         remainingPlayers.push(playerDoc);
       }
     }
 
-    if (remainingPlayers.length === 0) {
-      batch.delete(roomDoc.ref);
-      hasWrites = true;
-    } else {
-      const currentHostUid = roomData.hostUid ?? remainingPlayers[0].id;
-      const hasHost = remainingPlayers.some((player) => player.id === currentHostUid);
-      const nextHostUid = hasHost ? currentHostUid : remainingPlayers[0].id;
-      const shouldUpdateCount =
-        (roomData.playerCount ?? remainingPlayers.length) !== remainingPlayers.length;
-      const shouldUpdateHost = nextHostUid !== roomData.hostUid;
+    const shouldUpdateCount =
+      (roomData.playerCount ?? remainingPlayers.length) !== remainingPlayers.length;
+    const shouldResetState = roomData.state === "playing" && remainingPlayers.length < 2;
 
-      if (hasWrites || shouldUpdateCount || shouldUpdateHost) {
-        const updates: Record<string, unknown> = {
-          playerCount: remainingPlayers.length,
-          lastActiveAt: FieldValue.serverTimestamp(),
-          waitingSince:
-            remainingPlayers.length <= 1
-              ? FieldValue.serverTimestamp()
-              : roomData.waitingSince ?? null,
-        };
-        if (shouldUpdateHost) {
-          updates.hostUid = nextHostUid;
-        }
-        batch.update(roomDoc.ref, updates);
-        hasWrites = true;
-        if (shouldUpdateHost) {
-          const nextHostDoc = remainingPlayers.find((player) => player.id === nextHostUid);
-          if (nextHostDoc) {
-            batch.update(nextHostDoc.ref, { isHost: true });
-          }
-        }
+    if (hasWrites || shouldUpdateCount || shouldResetState) {
+      const updates: Record<string, unknown> = {
+        playerCount: remainingPlayers.length,
+        lastActiveAt: FieldValue.serverTimestamp(),
+        waitingSince:
+          remainingPlayers.length <= 1
+            ? FieldValue.serverTimestamp()
+            : roomData.waitingSince ?? null,
+      };
+      if (shouldResetState) {
+        updates.state = "waiting";
       }
+      batch.update(roomDoc.ref, updates);
+      hasWrites = true;
     }
 
     if (hasWrites) {

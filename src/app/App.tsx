@@ -1,12 +1,11 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { Users } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BubbleButton } from "./components/BubbleButton";
 import logo from "../assets/bc1bc1c44f6ba6cb1fd8be782ee33922cc6339af.png";
 import { auth, ensureAnonymousAuth } from "../lib/firebase";
 import {
   getActiveRoomId,
+  getGameConfig,
   joinMainRoom,
-  kickPlayer,
   leaveRoom,
   listenRoom,
   listenRoomPlayers,
@@ -14,17 +13,20 @@ import {
   startGame,
   touchPlayer,
   upsertUserProfile,
+  voteKickPlayer,
   type RoomData,
   type RoomPlayer,
 } from "../lib/rooms";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "./components/ui/dropdown-menu";
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "./components/ui/alert-dialog";
 
 type GameScreen = "menu" | "lobby" | "photo-select" | "role-reveal";
 type Role = "Marco" | "Reg";
@@ -41,17 +43,20 @@ export default function App() {
   const [isNameSaved, setIsNameSaved] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [photosSelected, setPhotosSelected] = useState(false);
+  const [photoError, setPhotoError] = useState<string | null>(null);
   const [role, setRole] = useState<Role | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
+  const [kickCandidate, setKickCandidate] = useState<RoomPlayer | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const isNameValid = useMemo(() => /[a-z0-9]/i.test(nameInput), [nameInput]);
   const canJoinGame = isNameSaved && isNameValid && authReady && !isBusy;
   const uid = auth.currentUser?.uid;
-  const isHost = room?.hostUid === uid;
   const currentPlayer = players.find((player) => player.id === uid) ?? null;
   const isCurrentPlayerReady = currentPlayer?.isReady === true;
-  const everyoneReady = players.length > 0 && players.every((player) => player.isReady === true);
+  const everyoneReady = players.length >= 2 && players.every((player) => player.isReady === true);
+  const voteKickThreshold = Math.max(2, Math.ceil((players.length - 1) / 2));
 
   useEffect(() => {
     const storedName = localStorage.getItem(NAME_STORAGE_KEY);
@@ -151,6 +156,26 @@ export default function App() {
     }
   }, [room?.state, screen]);
 
+  useEffect(() => {
+    if (!roomId || screen !== "lobby" || room?.state !== "waiting" || !everyoneReady || isBusy) {
+      return;
+    }
+    let isCancelled = false;
+    const autoStart = async () => {
+      try {
+        await startGame(roomId);
+      } catch (err) {
+        if (!isCancelled) {
+          setError((err as Error).message);
+        }
+      }
+    };
+    autoStart();
+    return () => {
+      isCancelled = true;
+    };
+  }, [roomId, room?.state, screen, everyoneReady, isBusy]);
+
   const handleSaveName = async () => {
     setError(null);
     if (!isNameValid) {
@@ -190,22 +215,6 @@ export default function App() {
     }
   };
 
-  const handleStartGame = async () => {
-    if (!roomId) {
-      return;
-    }
-    setError(null);
-    setIsBusy(true);
-    try {
-      await startGame(roomId);
-      setScreen("photo-select");
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setIsBusy(false);
-    }
-  };
-
   const handleToggleReady = async () => {
     if (!roomId) {
       return;
@@ -221,7 +230,24 @@ export default function App() {
     }
   };
 
+  const photosPerPlayer = room?.photosPerPlayer ?? getGameConfig(players.length).photosPerPlayer;
+
   const handleSelectPhotos = () => {
+    setPhotoError(null);
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) {
+      return;
+    }
+    if (files.length !== photosPerPlayer) {
+      setPhotoError(`Please select exactly ${photosPerPlayer} photo${photosPerPlayer !== 1 ? "s" : ""}. You selected ${files.length}.`);
+      event.target.value = "";
+      return;
+    }
+    setPhotoError(null);
     setPhotosSelected(true);
   };
 
@@ -249,23 +275,34 @@ export default function App() {
   };
 
   const handleRevealRole = () => {
-    const assignedRole: Role = Math.random() < 0.25 ? "Marco" : "Reg";
-    setRole(assignedRole);
+    if (!currentPlayer?.role) {
+      return;
+    }
+    setRole(currentPlayer.role as Role);
     setScreen("role-reveal");
   };
 
-  const handleKick = async (player: RoomPlayer) => {
+  const handleKick = (player: RoomPlayer) => {
     if (!roomId || player.id === uid) {
       return;
     }
-    const shouldKick = window.confirm(`Kick ${player.name} from the room?`);
-    if (!shouldKick) {
+    setKickCandidate(player);
+  };
+
+  const confirmKick = async () => {
+    if (!roomId || !kickCandidate) {
       return;
     }
     setError(null);
     setIsBusy(true);
     try {
-      await kickPlayer(roomId, player.id);
+      const result = await voteKickPlayer(roomId, kickCandidate.id);
+      setKickCandidate(null);
+      if (!result.kicked) {
+        setError(
+          `${kickCandidate.name} has ${result.voteCount}/${result.votesNeeded} votes.`,
+        );
+      }
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -307,7 +344,7 @@ export default function App() {
                   Join Game
                 </BubbleButton>
               </div>
-              <p className="text-sm text-gray-500">One shared lobby, up to 15 players.</p>
+              <p className="text-sm text-gray-500">One shared lobby, up to 19 players.</p>
               {!isNameValid && nameInput.length > 0 && (
                 <p className="text-sm text-red-500">
                   Name must contain at least one letter or number.
@@ -325,46 +362,14 @@ export default function App() {
 
         {screen === "lobby" && (
           <div className="space-y-6 sm:space-y-8">
-            <div className="flex items-start justify-between gap-4">
-              <h1 className="text-3xl sm:text-4xl lg:text-5xl">Game Lobby</h1>
-              {isHost && (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      className="bg-blue-500 text-white rounded-full p-3 shadow-lg hover:bg-blue-600"
-                      aria-label="Players"
-                    >
-                      <Users className="h-5 w-5" />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="min-w-[12rem]">
-                    <DropdownMenuLabel>Players</DropdownMenuLabel>
-                    <DropdownMenuSeparator />
-                    {players.map((player) => (
-                      <DropdownMenuItem
-                        key={player.id}
-                        onSelect={(event) => {
-                          event.preventDefault();
-                          handleKick(player);
-                        }}
-                        disabled={player.id === uid}
-                      >
-                        {player.name}
-                        {player.id === uid ? " (You)" : ""}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              )}
-            </div>
+            <h1 className="text-3xl sm:text-4xl lg:text-5xl">Game Lobby</h1>
             <div className="bg-white rounded-3xl p-6 sm:p-8 mb-6 shadow-lg">
               <p className="text-base sm:text-lg lg:text-xl mb-2">Room:</p>
               <p className="text-3xl sm:text-4xl lg:text-5xl font-bold text-blue-500 break-all">
                 Main Lobby
               </p>
               <p className="text-sm text-gray-500 mt-2">
-                {players.length}/15 players joined
+                {players.length}/19 players joined
               </p>
             </div>
             <div className="bg-white rounded-3xl p-6 sm:p-8 shadow-lg">
@@ -375,17 +380,25 @@ export default function App() {
                     key={player.id}
                     className="flex items-center justify-between border-b last:border-b-0 pb-2"
                   >
-                    <span className="text-base sm:text-lg">{player.name}</span>
-                    <div className="flex items-center gap-2">
+                    <span className="text-base sm:text-lg">
+                      {player.name}
+                      {player.id === uid ? " (You)" : ""}
+                    </span>
+                    <div className="flex items-center gap-3">
                       {player.isReady && (
                         <span className="text-xs uppercase tracking-wide text-green-600">
                           Ready
                         </span>
                       )}
-                      {player.isHost && (
-                        <span className="text-xs uppercase tracking-wide text-blue-500">
-                          Host
-                        </span>
+                      {player.id !== uid && (
+                        <button
+                          type="button"
+                          onClick={() => handleKick(player)}
+                          disabled={isBusy}
+                          className="text-sm font-semibold text-red-600 hover:text-red-700 disabled:text-red-300"
+                        >
+                          Vote Kick
+                        </button>
                       )}
                     </div>
                   </div>
@@ -404,11 +417,6 @@ export default function App() {
                 {isCurrentPlayerReady ? "Not Ready" : "Ready"}
               </BubbleButton>
             )}
-            {isHost && room?.state !== "playing" && (
-              <BubbleButton onClick={handleStartGame} disabled={isBusy || !everyoneReady}>
-                Continue to Select Photos
-              </BubbleButton>
-            )}
             <BubbleButton onClick={handleLeaveRoom} disabled={isBusy}>
               Leave Room
             </BubbleButton>
@@ -422,16 +430,27 @@ export default function App() {
             <p className="text-base sm:text-lg lg:text-xl mb-8">
               {photosSelected
                 ? "Photos selected! Reveal your role when you're all set."
-                : "Choose your photos for the game"}
+                : `Choose exactly ${photosPerPlayer} photo${photosPerPlayer !== 1 ? "s" : ""} from your camera roll or files.`}
             </p>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={handleFileChange}
+            />
             <div className="flex flex-col gap-4 items-center">
               {!photosSelected && (
                 <BubbleButton onClick={handleSelectPhotos} disabled={isBusy}>
                   Select Photos
                 </BubbleButton>
               )}
+              {photoError && (
+                <p className="text-sm text-red-500">{photoError}</p>
+              )}
               {photosSelected && (
-                <BubbleButton onClick={handleRevealRole} disabled={isBusy}>
+                <BubbleButton onClick={handleRevealRole} disabled={isBusy || !currentPlayer?.role}>
                   Reveal Role
                 </BubbleButton>
               )}
@@ -462,6 +481,37 @@ export default function App() {
           </div>
         )}
       </div>
+      <AlertDialog
+        open={Boolean(kickCandidate)}
+        onOpenChange={(open) => {
+          if (!open && !isBusy) {
+            setKickCandidate(null);
+          }
+        }}
+      >
+        <AlertDialogContent className="rounded-3xl border-2 border-blue-200">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-2xl text-blue-600">
+              Vote Kick Player?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-base text-gray-600">
+              {kickCandidate
+                ? `Vote to remove ${kickCandidate.name} from the room? ${voteKickThreshold} votes needed right now.`
+                : "Vote to remove this player from the room?"}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isBusy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmKick}
+              disabled={isBusy}
+              className="bg-red-600 text-white hover:bg-red-700"
+            >
+              {isBusy ? "Submitting..." : "Vote Kick"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
