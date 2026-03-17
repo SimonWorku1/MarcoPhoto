@@ -39,3 +39,5 @@ const ensureAnonymousAuth = async () => {
 initAnalytics();
 
 export { app, auth, db, ensureAnonymousAuth };
+
+export { getStorage } from "firebase/storage";

@@ -1,5 +1,6 @@
 import {
   doc,
+  deleteField,
   getDoc,
   getDocs,
   onSnapshot,
@@ -9,11 +10,38 @@ import {
   setDoc,
   serverTimestamp,
   updateDoc,
+  arrayUnion,
   collection,
 } from "firebase/firestore";
 import { auth, db } from "./firebase";
+import { uploadPhoto } from "./storage";
 
 export type RoomState = "waiting" | "playing";
+export type GamePhase =
+  | "round-action"
+  | "eliminated-reveal"
+  | "photo-reveal"
+  | "investigation"
+  | "game-over";
+
+export type MarcoSubmission = {
+  eliminatedPlayerId: string;
+  privatePhotoUrl: string;
+  publicPhotoUrl: string;
+};
+
+export type RoundData = {
+  roundPhase?: "action" | "clue" | "reveal" | "vote" | "done";
+  eliminatedPlayerId?: string;
+  privatePhotoUrl?: string;
+  marcoSubmissions?: Record<string, MarcoSubmission>;
+  marcoConfirmed?: string[];
+  publicPhotoUrls?: Record<string, string>;
+  eliminatedClue?: string;
+  investigationVotes?: Record<string, string>;
+  investigatedPlayerId?: string;
+  advanceToInvestigation?: boolean;
+};
 
 export type RoomSummary = {
   id: string;
@@ -23,6 +51,11 @@ export type RoomSummary = {
   marcoCount?: number;
   rounds?: number;
   photosPerPlayer?: number;
+  gamePhase?: GamePhase;
+  currentRound?: number;
+  eliminatedPlayerIds?: string[];
+  investigatedPlayerIds?: string[];
+  winner?: "Marco" | "Reg" | null;
 };
 
 export type RoomPlayer = {
@@ -32,6 +65,9 @@ export type RoomPlayer = {
   votekickCount?: number;
   joinedAt?: unknown;
   role?: "Marco" | "Reg";
+  photoUrls?: string[];
+  usedPhotoUrls?: string[];
+  hasUploadedPhotos?: boolean;
 };
 
 export type RoomData = RoomSummary & {
@@ -149,13 +185,28 @@ export const joinMainRoom = async (displayName: string) => {
       const roomData = roomSnap.data() as RoomData;
       const currentCount = roomData.playerCount ?? 0;
       const shouldResetRoom = currentCount < 2;
-      if (roomData.state !== "waiting" && !shouldResetRoom) {
-        throw new Error("Game already started.");
-      }
 
-      if (!playerSnap.exists()) {
+      if (playerSnap.exists()) {
+        // Existing player rejoining — always allowed regardless of game state
+        tx.set(
+          playerRef,
+          { name: displayName, lastSeenAt: serverTimestamp() },
+          { merge: true },
+        );
+        if (shouldResetRoom && roomData.state !== "waiting") {
+          tx.update(roomRef, {
+            state: "waiting",
+            lastActiveAt: serverTimestamp(),
+            waitingSince: serverTimestamp(),
+          });
+        }
+      } else {
+        // New player trying to join
+        if (roomData.state !== "waiting" && !shouldResetRoom) {
+          throw new Error("Game already started.");
+        }
         if (currentCount >= MAX_ROOM_PLAYERS) {
-          throw new Error("Room is full (15 players max).");
+          throw new Error("Room is full (19 players max).");
         }
         tx.set(playerRef, {
           name: displayName,
@@ -169,26 +220,8 @@ export const joinMainRoom = async (displayName: string) => {
           lastActiveAt: serverTimestamp(),
           waitingSince: currentCount + 1 <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
         };
-        if (shouldResetRoom) {
-          roomUpdates.state = "waiting";
-        }
+        if (shouldResetRoom) roomUpdates.state = "waiting";
         tx.update(roomRef, roomUpdates);
-      } else {
-        tx.set(
-          playerRef,
-          {
-            name: displayName,
-            lastSeenAt: serverTimestamp(),
-          },
-          { merge: true },
-        );
-        if (shouldResetRoom && roomData.state !== "waiting") {
-          tx.update(roomRef, {
-            state: "waiting",
-            lastActiveAt: serverTimestamp(),
-            waitingSince: serverTimestamp(),
-          });
-        }
       }
     }
 
@@ -277,10 +310,6 @@ export const voteKickPlayer = async (roomId: string, targetPlayerUid: string) =>
       Math.ceil((currentCount - 1) / 2),
     );
 
-    // #region agent log
-    fetch('http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ab149'},body:JSON.stringify({sessionId:'6ab149',location:'rooms.ts:voteKickPlayer',message:'vote cast - client only increments count, server handles kick',data:{nextVoteCount,votesNeeded,willKick:nextVoteCount>=votesNeeded,currentCount},timestamp:Date.now(),hypothesisId:'H-A'})}).catch(()=>{});
-    // #endregion
-
     // Cast vote and increment count — the Cloud Function handles the actual deletion
     // when the threshold is reached, avoiding client-side permission issues.
     tx.set(targetVoteRef, {
@@ -311,6 +340,123 @@ const fisherYatesShuffle = <T>(arr: T[]): T[] => {
   return a;
 };
 
+export const listenRound = (
+  roomId: string,
+  roundNum: number,
+  onRound: (round: RoundData | null) => void,
+) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(roundNum));
+  return onSnapshot(roundRef, (snapshot) => {
+    if (!snapshot.exists()) {
+      onRound(null);
+      return;
+    }
+    onRound(snapshot.data() as RoundData);
+  });
+};
+
+export const uploadPhotoPool = async (roomId: string, files: File[]) => {
+  const uid = requireUid();
+  const photoUrls: string[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const path = `marcophotos/${roomId}/${uid}/pool/${i}`;
+    const url = await uploadPhoto(path, files[i]);
+    photoUrls.push(url);
+  }
+  const playerRef = doc(db, "rooms", roomId, "players", uid);
+  await updateDoc(playerRef, {
+    photoUrls,
+    usedPhotoUrls: [],
+    hasUploadedPhotos: true,
+  });
+};
+
+export const submitMarcoAction = async (
+  roomId: string,
+  round: number,
+  eliminatedPlayerId: string,
+  privatePhotoUrl: string,
+  publicPhotoUrl: string,
+) => {
+  const uid = requireUid();
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const playerRef = doc(db, "rooms", roomId, "players", uid);
+  // Submitting counts as confirming your own proposal; reset other confirmations
+  await updateDoc(roundRef, {
+    [`marcoSubmissions.${uid}`]: { eliminatedPlayerId, privatePhotoUrl, publicPhotoUrl },
+    marcoConfirmed: [uid],
+  });
+  await updateDoc(playerRef, {
+    usedPhotoUrls: arrayUnion(privatePhotoUrl, publicPhotoUrl),
+  });
+};
+
+export const confirmMarcoAction = async (roomId: string, round: number) => {
+  const uid = requireUid();
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  await updateDoc(roundRef, {
+    marcoConfirmed: arrayUnion(uid),
+  });
+};
+
+export const submitRegPhoto = async (
+  roomId: string,
+  round: number,
+  photoUrl: string,
+) => {
+  const uid = requireUid();
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const playerRef = doc(db, "rooms", roomId, "players", uid);
+  await updateDoc(roundRef, {
+    [`publicPhotoUrls.${uid}`]: photoUrl,
+  });
+  await updateDoc(playerRef, {
+    usedPhotoUrls: arrayUnion(photoUrl),
+  });
+};
+
+export const submitMarcoPublicPhoto = async (
+  roomId: string,
+  round: number,
+  photoUrl: string,
+) => {
+  const uid = requireUid();
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const playerRef = doc(db, "rooms", roomId, "players", uid);
+  await updateDoc(roundRef, {
+    [`publicPhotoUrls.${uid}`]: photoUrl,
+  });
+  await updateDoc(playerRef, {
+    usedPhotoUrls: arrayUnion(photoUrl),
+  });
+};
+
+export const submitEliminatedClue = async (
+  roomId: string,
+  round: number,
+  clue: string,
+) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  await updateDoc(roundRef, { eliminatedClue: clue });
+};
+
+export const advanceToInvestigation = async (roomId: string, round: number) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  await updateDoc(roundRef, { advanceToInvestigation: true });
+};
+
+export const submitInvestigationVote = async (
+  roomId: string,
+  round: number,
+  targetUid: string,
+) => {
+  const uid = requireUid();
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  await updateDoc(roundRef, {
+    [`investigationVotes.${uid}`]: targetUid,
+  });
+};
+
 export const startGame = async (roomId: string) => {
   requireUid();
   const roomRef = doc(db, "rooms", roomId);
@@ -321,6 +467,13 @@ export const startGame = async (roomId: string) => {
     if (!roomSnap.exists()) {
       throw new Error("Room not found.");
     }
+    const roomData = roomSnap.data() as RoomData;
+
+    // Guard: if another client's transaction already started the game, bail out.
+    // Without this, all clients run concurrent transactions with different shuffles
+    // and the last one to commit overwrites the Marco assignment, resulting in all Regs.
+    if (roomData.state === "playing") return;
+
     const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
     if (playersSnap.size < 4) {
       throw new Error("Need at least 4 players to start.");
@@ -338,11 +491,18 @@ export const startGame = async (roomId: string) => {
       tx.update(playerRef, { role: i < marcoCount ? "Marco" : "Reg" });
     }
 
+    // Reset all stale game state from any previous game so old eliminated players
+    // and round data can't bleed into the new game (fixes: old eliminatedPlayerIds showing).
     tx.update(roomRef, {
       state: "playing",
       marcoCount,
       rounds,
       photosPerPlayer,
+      gamePhase: deleteField(),
+      currentRound: deleteField(),
+      eliminatedPlayerIds: deleteField(),
+      investigatedPlayerIds: deleteField(),
+      winner: deleteField(),
       lastActiveAt: serverTimestamp(),
     });
   });

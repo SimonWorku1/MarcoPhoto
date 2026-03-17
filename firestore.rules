@@ -68,7 +68,9 @@ service cloud.firestore {
         && !request.resource.data.keys().hasAny(["hostUid"])
         && request.resource.data.diff(resource.data).changedKeys()
           .hasOnly(["playerCount", "lastActiveAt", "waitingSince", "state",
-                    "marcoCount", "rounds", "photosPerPlayer"]);
+                    "marcoCount", "rounds", "photosPerPlayer",
+                    "gamePhase", "currentRound", "eliminatedPlayerIds",
+                    "investigatedPlayerIds", "winner"]);
       allow delete: if false;
 
       match /players/{playerId} {
@@ -92,6 +94,16 @@ service cloud.firestore {
               && request.resource.data.name is string
               && request.resource.data.name.size() > 0
               && request.resource.data.isReady is bool
+            )
+            || (
+              request.auth.uid == playerId
+              && request.resource.data.diff(resource.data).changedKeys()
+                .hasOnly(["photoUrls", "usedPhotoUrls", "hasUploadedPhotos"])
+            )
+            || (
+              request.auth.uid == playerId
+              && request.resource.data.diff(resource.data).changedKeys()
+                .hasOnly(["usedPhotoUrls"])
             )
             || (
               request.auth.uid != playerId
@@ -127,6 +139,25 @@ service cloud.firestore {
             && request.resource.data.voterUid == request.auth.uid;
           allow update, delete: if false;
         }
+      }
+
+      match /rounds/{roundNum} {
+        allow read: if isSignedIn() && roomId == "main";
+        allow create: if isSignedIn() && roomId == "main";
+        allow update: if isSignedIn()
+          && roomId == "main"
+          && (
+            request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["marcoSubmissions", "marcoConfirmed"])
+            || request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["publicPhotoUrls"])
+            || request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["eliminatedClue"])
+            || request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["advanceToInvestigation"])
+            || request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["investigationVotes"])
+          );
       }
     }
 
