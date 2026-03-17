@@ -249,7 +249,6 @@ export const voteKickPlayer = async (roomId: string, targetPlayerUid: string) =>
   const voterPlayerRef = doc(playersRef, uid);
   const targetPlayerRef = doc(playersRef, targetPlayerUid);
   const targetVoteRef = doc(db, "rooms", roomId, "players", targetPlayerUid, "votes", uid);
-  const targetUserRef = doc(db, "users", targetPlayerUid);
 
   return runTransaction(db, async (tx) => {
     const roomSnap = await tx.get(roomRef);
@@ -278,38 +277,19 @@ export const voteKickPlayer = async (roomId: string, targetPlayerUid: string) =>
       Math.ceil((currentCount - 1) / 2),
     );
 
+    // #region agent log
+    fetch('http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ab149'},body:JSON.stringify({sessionId:'6ab149',location:'rooms.ts:voteKickPlayer',message:'vote cast - client only increments count, server handles kick',data:{nextVoteCount,votesNeeded,willKick:nextVoteCount>=votesNeeded,currentCount},timestamp:Date.now(),hypothesisId:'H-A'})}).catch(()=>{});
+    // #endregion
+
+    // Cast vote and increment count — the Cloud Function handles the actual deletion
+    // when the threshold is reached, avoiding client-side permission issues.
     tx.set(targetVoteRef, {
       voterUid: uid,
       createdAt: serverTimestamp(),
     });
+    tx.update(targetPlayerRef, { votekickCount: nextVoteCount });
 
-    if (nextVoteCount < votesNeeded) {
-      tx.update(targetPlayerRef, { votekickCount: nextVoteCount });
-      return { kicked: false, voteCount: nextVoteCount, votesNeeded };
-    }
-
-    const nextCount = Math.max(currentCount - 1, 0);
-    const roomUpdates: Partial<RoomData> & { state?: RoomState } = {
-      playerCount: nextCount,
-      lastActiveAt: serverTimestamp(),
-      waitingSince: nextCount <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
-    };
-
-    if (nextCount < 2) {
-      roomUpdates.state = "waiting";
-    }
-
-    tx.update(roomRef, roomUpdates);
-    tx.delete(targetPlayerRef);
-    tx.set(
-      targetUserRef,
-      {
-        activeRoomId: null,
-      },
-      { merge: true },
-    );
-
-    return { kicked: true, voteCount: nextVoteCount, votesNeeded };
+    return { kicked: nextVoteCount >= votesNeeded, voteCount: nextVoteCount, votesNeeded };
   });
 };
 
@@ -342,8 +322,8 @@ export const startGame = async (roomId: string) => {
       throw new Error("Room not found.");
     }
     const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
-    if (playersSnap.size < 2) {
-      throw new Error("Need at least two players.");
+    if (playersSnap.size < 4) {
+      throw new Error("Need at least 4 players to start.");
     }
     const everyoneReady = playersSnap.docs.every((d) => d.data().isReady === true);
     if (!everyoneReady) {

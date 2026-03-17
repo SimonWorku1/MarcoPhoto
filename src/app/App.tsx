@@ -55,7 +55,7 @@ export default function App() {
   const uid = auth.currentUser?.uid;
   const currentPlayer = players.find((player) => player.id === uid) ?? null;
   const isCurrentPlayerReady = currentPlayer?.isReady === true;
-  const everyoneReady = players.length >= 2 && players.every((player) => player.isReady === true);
+  const everyoneReady = players.length >= 4 && players.every((player) => player.isReady === true);
   const voteKickThreshold = Math.max(2, Math.ceil((players.length - 1) / 2));
 
   useEffect(() => {
@@ -297,6 +297,9 @@ export default function App() {
     setIsBusy(true);
     try {
       const result = await voteKickPlayer(roomId, kickCandidate.id);
+      // #region agent log
+      fetch('http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ab149'},body:JSON.stringify({sessionId:'6ab149',location:'App.tsx:confirmKick',message:'voteKickPlayer succeeded',data:{kicked:result.kicked,voteCount:result.voteCount,votesNeeded:result.votesNeeded},timestamp:Date.now(),hypothesisId:'H-F'})}).catch(()=>{});
+      // #endregion
       setKickCandidate(null);
       if (!result.kicked) {
         setError(
@@ -304,6 +307,9 @@ export default function App() {
         );
       }
     } catch (err) {
+      // #region agent log
+      fetch('http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'6ab149'},body:JSON.stringify({sessionId:'6ab149',location:'App.tsx:confirmKick',message:'voteKickPlayer FAILED',data:{error:(err as Error).message},timestamp:Date.now(),hypothesisId:'H-F'})}).catch(()=>{});
+      // #endregion
       setError((err as Error).message);
     } finally {
       setIsBusy(false);
@@ -408,9 +414,11 @@ export default function App() {
             <p className="text-base sm:text-lg lg:text-xl">
               {room?.state === "playing"
                 ? "Game in progress."
-                : everyoneReady
-                  ? "Everyone is ready."
-                  : "Waiting for everyone to ready up..."}
+                : players.length < 4
+                  ? `Waiting for players… ${players.length}/4 minimum to start.`
+                  : everyoneReady
+                    ? "Everyone is ready. Starting game..."
+                    : "Waiting for everyone to ready up..."}
             </p>
             {room?.state !== "playing" && (
               <BubbleButton onClick={handleToggleReady} disabled={isBusy || !currentPlayer}>
