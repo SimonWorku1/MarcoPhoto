@@ -120,6 +120,33 @@ function MathSection({
   );
 }
 
+async function ensureJpeg(file: File): Promise<File> {
+  const isHeic =
+    file.type === "image/heic" ||
+    file.type === "image/heif" ||
+    file.name.toLowerCase().endsWith(".heic") ||
+    file.name.toLowerCase().endsWith(".heif");
+  if (!isHeic) return file;
+  // Safari supports HEIC/HEIF natively; Chrome does not.
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    throw new Error(
+      "This browser can't read HEIC/HEIF photos. Open the app in Safari, or save your photos as JPEG before selecting them."
+    );
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const blob = await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Canvas export failed"))), "image/jpeg", 0.85)
+  );
+  return new File([blob], file.name.replace(/\.(heic|heif)$/i, ".jpg"), { type: "image/jpeg" });
+}
+
 export default function App() {
   const [screen, setScreen] = useState<GameScreen>("menu");
   const [roomId, setRoomId] = useState<string | null>(null);
@@ -155,6 +182,9 @@ export default function App() {
 
   // Investigation vote state
   const [myVote, setMyVote] = useState<string | null>(null);
+
+  // Rules modal state
+  const [showRules, setShowRules] = useState(false);
 
   // Math question state (for Regs/eliminated during round-action)
   const [mathQ, setMathQ] = useState<MathQuestion>(() => createMathQuestion());
@@ -390,7 +420,7 @@ export default function App() {
     fileInputRef.current?.click();
   };
 
-  const handleUploadFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUploadFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     if (files.length !== photosPerPlayer) {
@@ -399,7 +429,16 @@ export default function App() {
       return;
     }
     setUploadError(null);
-    setUploadFiles(Array.from(files));
+    setIsUploading(true);
+    try {
+      const converted = await Promise.all(Array.from(files).map(ensureJpeg));
+      setUploadFiles(converted);
+    } catch (err) {
+      setUploadError("Failed to process one or more photos. Please try again.");
+      console.error(err);
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   const handleUploadPhotos = async () => {
@@ -665,6 +704,19 @@ export default function App() {
                 <p className="text-lg sm:text-2xl mt-6">
                   {role === "Marco" ? "You're a Marco! Pick targets and deceive the Regs." : "You're a Reg. Find the Marcos!"}
                 </p>
+                {role === "Marco" && (() => {
+                  const fellowMarcos = players.filter((p) => p.role === "Marco" && p.id !== uid);
+                  return fellowMarcos.length > 0 ? (
+                    <div className="bg-blue-50 border-2 border-blue-200 rounded-2xl p-4 text-left">
+                      <p className="text-sm font-semibold text-blue-600 uppercase tracking-wide mb-2">Fellow Marcos</p>
+                      <ul className="space-y-1">
+                        {fellowMarcos.map((p) => (
+                          <li key={p.id} className="text-base sm:text-lg font-medium text-blue-800">{p.name}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null;
+                })()}
                 <BubbleButton onClick={() => setHasRevealedRole(true)}>
                   Enter Game
                 </BubbleButton>
@@ -1043,6 +1095,51 @@ export default function App() {
         )}
 
       </div>
+
+      {/* ── Rules button ──────────────────────────────────────────────────── */}
+      <button
+        type="button"
+        onClick={() => setShowRules(true)}
+        className="fixed top-4 right-4 z-50 w-10 h-10 rounded-full bg-blue-500 text-white text-xl font-bold shadow-lg flex items-center justify-center hover:bg-blue-600 active:scale-95 transition-all"
+        aria-label="Game rules"
+      >
+        ?
+      </button>
+
+      {/* ── Rules modal ───────────────────────────────────────────────────── */}
+      {showRules && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4"
+          onClick={() => setShowRules(false)}
+        >
+          <div
+            className="bg-white rounded-3xl p-6 sm:p-8 shadow-2xl max-w-sm w-full text-left space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-2xl font-bold text-blue-600">How to Play</h2>
+              <button
+                type="button"
+                onClick={() => setShowRules(false)}
+                className="text-gray-400 hover:text-gray-600 text-2xl leading-none"
+                aria-label="Close rules"
+              >
+                ×
+              </button>
+            </div>
+            <ol className="space-y-3 text-sm text-gray-700 list-decimal list-inside leading-relaxed">
+              <li>Don't leak what's on your device!!!</li>
+              <li>One or more players are secretly assigned as <strong>Marcos</strong>. Everyone else is a <strong>Regular</strong>.</li>
+              <li>Marcos know who each other are. Regulars know nothing.</li>
+              <li>Each round, Marcos secretly agree on a player to <strong>eliminate</strong> and pick two photos — a <strong>private</strong> one (only the eliminated player sees) and a <strong>public</strong> one (everyone sees).</li>
+              <li>Each Regular picks one <strong>public photo</strong> to share with the group.</li>
+              <li>The eliminated player sees their private photo and gives the group a <strong>one-word clue</strong>.</li>
+              <li>Everyone votes to <strong>investigate</strong> who they think is a Marco. The most-voted player is revealed.</li>
+              <li><strong>Regs win</strong> by successfully investigating all Marcos. <strong>Marcos win</strong> by surviving all rounds.</li>
+            </ol>
+          </div>
+        </div>
+      )}
 
       {/* ── Vote kick dialog ──────────────────────────────────────────────── */}
       <AlertDialog
