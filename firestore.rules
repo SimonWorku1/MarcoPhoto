@@ -5,21 +5,6 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function hasProfile() {
-      return isSignedIn()
-        && (
-          (
-            exists(/databases/$(database)/documents/users/$(request.auth.uid))
-            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName is string
-            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName.size() > 0
-          ) || (
-            existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
-            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName is string
-            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName.size() > 0
-          )
-        );
-    }
-
     function canClearRemovedPlayerActiveRoom(userId) {
       return request.auth.uid != userId
         && resource.data.activeRoomId is string
@@ -68,7 +53,7 @@ service cloud.firestore {
         && !request.resource.data.keys().hasAny(["hostUid"])
         && request.resource.data.diff(resource.data).changedKeys()
           .hasOnly(["playerCount", "lastActiveAt", "waitingSince", "state",
-                    "marcoCount", "rounds", "photosPerPlayer",
+                    "marcoCount", "rounds",
                     "gamePhase", "currentRound", "eliminatedPlayerIds",
                     "investigatedPlayerIds", "winner"]);
       allow delete: if false;
@@ -94,16 +79,6 @@ service cloud.firestore {
               && request.resource.data.name is string
               && request.resource.data.name.size() > 0
               && request.resource.data.isReady is bool
-            )
-            || (
-              request.auth.uid == playerId
-              && request.resource.data.diff(resource.data).changedKeys()
-                .hasOnly(["photoUrls", "usedPhotoUrls", "hasUploadedPhotos"])
-            )
-            || (
-              request.auth.uid == playerId
-              && request.resource.data.diff(resource.data).changedKeys()
-                .hasOnly(["usedPhotoUrls"])
             )
             || (
               request.auth.uid != playerId
@@ -147,17 +122,80 @@ service cloud.firestore {
         allow update: if isSignedIn()
           && roomId == "main"
           && (
-            request.resource.data.diff(resource.data).changedKeys()
-              .hasOnly(["marcoSubmissions", "marcoConfirmed"])
-            || request.resource.data.diff(resource.data).changedKeys()
-              .hasOnly(["publicPhotoUrls"])
-            || request.resource.data.diff(resource.data).changedKeys()
-              .hasOnly(["eliminatedClue"])
+            // startGame resets an existing round doc for a new game
+            (
+              getAfter(/databases/$(database)/documents/rooms/main).data.state == "playing"
+              && getAfter(/databases/$(database)/documents/rooms/main).data.gamePhase == "round-upload"
+            )
+            // Any player can submit their own photo to the submissions map
+            || request.resource.data.diff(resource.data).changedKeys().hasOnly(["submissions"])
+            || (
+              // Marco submits/overrides elimination target
+              request.resource.data.diff(resource.data).changedKeys()
+                .hasOnly(["marcoSubmission", "marcoConfirmed"])
+            )
+            || (
+              // Additional Marcos confirm the proposal
+              request.resource.data.diff(resource.data).changedKeys()
+                .hasOnly(["marcoConfirmed"])
+            )
+            || (
+              // Eliminated player chooses clue word
+              request.resource.data.diff(resource.data).changedKeys()
+                .hasOnly(["selectedClue"])
+            )
             || request.resource.data.diff(resource.data).changedKeys()
               .hasOnly(["advanceToInvestigation"])
             || request.resource.data.diff(resource.data).changedKeys()
               .hasOnly(["investigationVotes"])
+            || (
+              // Any player can advance upload → elimination once all submissions are in.
+              // "action" is the legacy roundPhase name used by the old Cloud Function (same as "upload").
+              resource.data.roundPhase in ["upload", "action"]
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["roundPhase"])
+              && request.resource.data.roundPhase == "elimination"
+            )
+            || (
+              // Client-side fallback: elimination → clue (also sets eliminatedPlayerId)
+              resource.data.roundPhase == "elimination"
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["roundPhase", "eliminatedPlayerId"])
+              && request.resource.data.roundPhase == "clue"
+            )
+            || (
+              // Client-side fallback: clue → reveal
+              resource.data.roundPhase == "clue"
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["roundPhase"])
+              && request.resource.data.roundPhase == "reveal"
+            )
+            || (
+              // Client-side fallback: reveal → vote
+              resource.data.roundPhase == "reveal"
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["roundPhase"])
+              && request.resource.data.roundPhase == "vote"
+            )
+            || (
+              // Client-side fallback: vote → done (also sets investigatedPlayerId)
+              resource.data.roundPhase == "vote"
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["roundPhase", "investigatedPlayerId"])
+              && request.resource.data.roundPhase == "done"
+            )
+            || (
+              // Client-side: patch missing theme/clueOptions on round created by old CF
+              resource.data.roundPhase in ["action", "upload"]
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(["theme", "clueOptions"])
+            )
           );
+
+        // Private subcollection — written by client-side fallback when Cloud Functions are not deployed.
+        // create AND update are both needed because a leftover doc from a previous run triggers
+        // an overwrite which Firestore evaluates as an update, not a create.
+        match /private/{docId} {
+          allow read: if isSignedIn()
+            && roomId == "main"
+            && resource.data.forPlayerId == request.auth.uid;
+          allow create, update: if isSignedIn() && roomId == "main";
+          allow delete: if false;
+        }
       }
     }
 

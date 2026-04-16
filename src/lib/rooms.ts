@@ -1,6 +1,5 @@
 import {
   doc,
-  deleteField,
   getDoc,
   getDocs,
   onSnapshot,
@@ -15,31 +14,29 @@ import {
 } from "firebase/firestore";
 import { auth, db } from "./firebase";
 import { uploadPhoto } from "./storage";
+import { THEMES, pickClueOptions } from "./gameConstants";
 
 export type RoomState = "waiting" | "playing";
 export type GamePhase =
-  | "round-action"
+  | "round-upload"
+  | "round-elimination"
   | "eliminated-reveal"
   | "photo-reveal"
   | "investigation"
-  | "game-over";
-
-export type MarcoSubmission = {
-  eliminatedPlayerId: string;
-  privatePhotoUrl: string;
-  publicPhotoUrl: string;
-};
+  | "game-over"
+  | "round-action"; // legacy name used by older deployed Cloud Functions (equivalent to "round-upload")
 
 export type RoundData = {
-  roundPhase?: "action" | "clue" | "reveal" | "vote" | "done";
-  eliminatedPlayerId?: string;
-  privatePhotoUrl?: string;
-  marcoSubmissions?: Record<string, MarcoSubmission>;
+  roundPhase: "upload" | "elimination" | "clue" | "reveal" | "vote" | "done" | "action"; // "action" is a legacy name used by older deployed Cloud Functions (equivalent to "upload")
+  theme: string;
+  clueOptions: string[];
+  submissions: Record<string, string>; // playerId → photoUrl
+  marcoSubmission?: { eliminatedPlayerId: string; marcoPlayerId: string } | null;
   marcoConfirmed?: string[];
-  publicPhotoUrls?: Record<string, string>;
-  eliminatedClue?: string;
+  eliminatedPlayerId?: string | null;
+  selectedClue?: string | null;
   investigationVotes?: Record<string, string>;
-  investigatedPlayerId?: string;
+  investigatedPlayerId?: string | null;
   advanceToInvestigation?: boolean;
 };
 
@@ -50,7 +47,6 @@ export type RoomSummary = {
   createdAt?: unknown;
   marcoCount?: number;
   rounds?: number;
-  photosPerPlayer?: number;
   gamePhase?: GamePhase;
   currentRound?: number;
   eliminatedPlayerIds?: string[];
@@ -65,9 +61,6 @@ export type RoomPlayer = {
   votekickCount?: number;
   joinedAt?: unknown;
   role?: "Marco" | "Reg";
-  photoUrls?: string[];
-  usedPhotoUrls?: string[];
-  hasUploadedPhotos?: boolean;
 };
 
 export type RoomData = RoomSummary & {
@@ -75,11 +68,29 @@ export type RoomData = RoomSummary & {
   lastActiveAt?: unknown;
 };
 
+// rounds = n − 2m − 1: the last round always has (m+1) active Regs vs m Marcos,
+// ensuring every round — including the final one — is winnable by the Regs.
+const GAME_CONFIG_TABLE: Record<number, { marcoCount: number; rounds: number }> = {
+   4: { marcoCount: 1, rounds:  1 },
+   5: { marcoCount: 1, rounds:  2 },
+   6: { marcoCount: 1, rounds:  3 },
+   7: { marcoCount: 1, rounds:  4 },
+   8: { marcoCount: 2, rounds:  3 },
+   9: { marcoCount: 2, rounds:  4 },
+  10: { marcoCount: 2, rounds:  5 },
+  11: { marcoCount: 2, rounds:  6 },
+  12: { marcoCount: 3, rounds:  5 },
+  13: { marcoCount: 3, rounds:  6 },
+  14: { marcoCount: 3, rounds:  7 },
+  15: { marcoCount: 3, rounds:  8 },
+  16: { marcoCount: 4, rounds:  7 },
+  17: { marcoCount: 4, rounds:  8 },
+  18: { marcoCount: 4, rounds:  9 },
+  19: { marcoCount: 4, rounds: 10 },
+};
+
 export const getGameConfig = (playerCount: number) => {
-  if (playerCount >= 16) return { marcoCount: 4, rounds: 12, photosPerPlayer: 24 };
-  if (playerCount >= 12) return { marcoCount: 3, rounds: 9, photosPerPlayer: 18 };
-  if (playerCount >= 8) return { marcoCount: 2, rounds: 6, photosPerPlayer: 12 };
-  return { marcoCount: 1, rounds: 3, photosPerPlayer: 6 };
+  return GAME_CONFIG_TABLE[playerCount] ?? GAME_CONFIG_TABLE[19];
 };
 
 const MAIN_ROOM_ID = "main";
@@ -88,40 +99,27 @@ const VOTE_KICK_MIN_THRESHOLD = 2;
 
 const requireUid = () => {
   const uid = auth.currentUser?.uid;
-  if (!uid) {
-    throw new Error("Not signed in.");
-  }
+  if (!uid) throw new Error("Not signed in.");
   return uid;
 };
 
 export const upsertUserProfile = async (displayName: string) => {
   const uid = requireUid();
   const userRef = doc(db, "users", uid);
-  await setDoc(
-    userRef,
-    {
-      displayName,
-    },
-    { merge: true },
-  );
+  await setDoc(userRef, { displayName }, { merge: true });
 };
 
 export const getActiveRoomId = async () => {
   const uid = requireUid();
   const userSnap = await getDoc(doc(db, "users", uid));
-  if (!userSnap.exists()) {
-    return null;
-  }
+  if (!userSnap.exists()) return null;
   return (userSnap.data().activeRoomId as string | null) ?? null;
 };
 
 export const listenRoom = (roomId: string, onRoom: (room: RoomData | null) => void) => {
   const roomRef = doc(db, "rooms", roomId);
   return onSnapshot(roomRef, (snapshot) => {
-    if (!snapshot.exists()) {
-      onRoom(null);
-      return;
-    }
+    if (!snapshot.exists()) { onRoom(null); return; }
     const data = snapshot.data() as Omit<RoomData, "id">;
     onRoom({ id: snapshot.id, ...data });
   });
@@ -133,7 +131,6 @@ export const listenRoomPlayers = (
 ) => {
   const playersRef = collection(db, "rooms", roomId, "players");
   const playersQuery = query(playersRef, orderBy("joinedAt", "asc"));
-
   return onSnapshot(playersQuery, (snapshot) => {
     const players = snapshot.docs.map((docSnap) => {
       const data = docSnap.data() as Omit<RoomPlayer, "id">;
@@ -146,9 +143,7 @@ export const listenRoomPlayers = (
 export const touchPlayer = async (roomId: string) => {
   const uid = requireUid();
   const playerRef = doc(db, "rooms", roomId, "players", uid);
-  await updateDoc(playerRef, {
-    lastSeenAt: serverTimestamp(),
-  });
+  await updateDoc(playerRef, { lastSeenAt: serverTimestamp() });
 };
 
 export const joinMainRoom = async (displayName: string) => {
@@ -187,12 +182,7 @@ export const joinMainRoom = async (displayName: string) => {
       const shouldResetRoom = currentCount < 2;
 
       if (playerSnap.exists()) {
-        // Existing player rejoining — always allowed regardless of game state
-        tx.set(
-          playerRef,
-          { name: displayName, lastSeenAt: serverTimestamp() },
-          { merge: true },
-        );
+        tx.set(playerRef, { name: displayName, lastSeenAt: serverTimestamp() }, { merge: true });
         if (shouldResetRoom && roomData.state !== "waiting") {
           tx.update(roomRef, {
             state: "waiting",
@@ -201,7 +191,6 @@ export const joinMainRoom = async (displayName: string) => {
           });
         }
       } else {
-        // New player trying to join
         if (roomData.state !== "waiting" && !shouldResetRoom) {
           throw new Error("Game already started.");
         }
@@ -225,15 +214,7 @@ export const joinMainRoom = async (displayName: string) => {
       }
     }
 
-    tx.set(
-      userRef,
-      {
-        displayName,
-        activeRoomId: MAIN_ROOM_ID,
-      },
-      { merge: true },
-    );
-
+    tx.set(userRef, { displayName, activeRoomId: MAIN_ROOM_ID }, { merge: true });
     return { roomId: MAIN_ROOM_ID };
   });
 };
@@ -254,28 +235,17 @@ export const leaveRoom = async (roomId: string) => {
         lastActiveAt: serverTimestamp(),
         waitingSince: nextCount <= 1 ? serverTimestamp() : roomData.waitingSince ?? null,
       };
-      if (nextCount < 2) {
-        updates.state = "waiting";
-      }
+      if (nextCount < 2) updates.state = "waiting";
       tx.update(roomRef, updates);
     }
-
     tx.delete(playerRef);
-    tx.set(
-      userRef,
-      {
-        activeRoomId: null,
-      },
-      { merge: true },
-    );
+    tx.set(userRef, { activeRoomId: null }, { merge: true });
   });
 };
 
 export const voteKickPlayer = async (roomId: string, targetPlayerUid: string) => {
   const uid = requireUid();
-  if (uid === targetPlayerUid) {
-    throw new Error("You cannot vote kick yourself.");
-  }
+  if (uid === targetPlayerUid) throw new Error("You cannot vote kick yourself.");
 
   const roomRef = doc(db, "rooms", roomId);
   const playersRef = collection(db, "rooms", roomId, "players");
@@ -285,37 +255,21 @@ export const voteKickPlayer = async (roomId: string, targetPlayerUid: string) =>
 
   return runTransaction(db, async (tx) => {
     const roomSnap = await tx.get(roomRef);
-    if (!roomSnap.exists()) {
-      throw new Error("Room not found.");
-    }
+    if (!roomSnap.exists()) throw new Error("Room not found.");
     const voterPlayerSnap = await tx.get(voterPlayerRef);
-    if (!voterPlayerSnap.exists()) {
-      throw new Error("You are not in this room.");
-    }
+    if (!voterPlayerSnap.exists()) throw new Error("You are not in this room.");
     const targetPlayerSnap = await tx.get(targetPlayerRef);
-    if (!targetPlayerSnap.exists()) {
-      throw new Error("Player is no longer in this room.");
-    }
+    if (!targetPlayerSnap.exists()) throw new Error("Player is no longer in this room.");
     const existingVoteSnap = await tx.get(targetVoteRef);
-    if (existingVoteSnap.exists()) {
-      throw new Error("You already voted to kick this player.");
-    }
+    if (existingVoteSnap.exists()) throw new Error("You already voted to kick this player.");
 
     const roomData = roomSnap.data() as RoomData;
     const targetPlayerData = targetPlayerSnap.data() as RoomPlayer;
     const currentCount = roomData.playerCount ?? 0;
     const nextVoteCount = (targetPlayerData.votekickCount ?? 0) + 1;
-    const votesNeeded = Math.max(
-      VOTE_KICK_MIN_THRESHOLD,
-      Math.ceil((currentCount - 1) / 2),
-    );
+    const votesNeeded = Math.max(VOTE_KICK_MIN_THRESHOLD, Math.ceil((currentCount - 1) / 2));
 
-    // Cast vote and increment count — the Cloud Function handles the actual deletion
-    // when the threshold is reached, avoiding client-side permission issues.
-    tx.set(targetVoteRef, {
-      voterUid: uid,
-      createdAt: serverTimestamp(),
-    });
+    tx.set(targetVoteRef, { voterUid: uid, createdAt: serverTimestamp() });
     tx.update(targetPlayerRef, { votekickCount: nextVoteCount });
 
     return { kicked: nextVoteCount >= votesNeeded, voteCount: nextVoteCount, votesNeeded };
@@ -325,10 +279,7 @@ export const voteKickPlayer = async (roomId: string, targetPlayerUid: string) =>
 export const setPlayerReady = async (roomId: string, isReady: boolean) => {
   const uid = requireUid();
   const playerRef = doc(db, "rooms", roomId, "players", uid);
-  await updateDoc(playerRef, {
-    isReady,
-    lastSeenAt: serverTimestamp(),
-  });
+  await updateDoc(playerRef, { isReady, lastSeenAt: serverTimestamp() });
 };
 
 const fisherYatesShuffle = <T>(arr: T[]): T[] => {
@@ -347,98 +298,230 @@ export const listenRound = (
 ) => {
   const roundRef = doc(db, "rooms", roomId, "rounds", String(roundNum));
   return onSnapshot(roundRef, (snapshot) => {
-    if (!snapshot.exists()) {
-      onRound(null);
-      return;
-    }
+    if (!snapshot.exists()) { onRound(null); return; }
     onRound(snapshot.data() as RoundData);
   });
 };
 
-export const uploadPhotoPool = async (roomId: string, files: File[]) => {
-  const uid = requireUid();
-  const photoUrls: string[] = [];
-  for (let i = 0; i < files.length; i++) {
-    const path = `marcophotos/${roomId}/${uid}/pool/${i}`;
-    const url = await uploadPhoto(path, files[i]);
-    photoUrls.push(url);
-  }
-  const playerRef = doc(db, "rooms", roomId, "players", uid);
-  await updateDoc(playerRef, {
-    photoUrls,
-    usedPhotoUrls: [],
-    hasUploadedPhotos: true,
+export const listenRoundPrivate = (
+  roomId: string,
+  roundNum: number,
+  onPrivate: (data: { marcoPhotoUrl: string; forPlayerId: string } | null) => void,
+) => {
+  const privateRef = doc(db, "rooms", roomId, "rounds", String(roundNum), "private", "reveal");
+  return onSnapshot(privateRef, (snapshot) => {
+    if (!snapshot.exists()) { onPrivate(null); return; }
+    onPrivate(snapshot.data() as { marcoPhotoUrl: string; forPlayerId: string });
   });
 };
 
-export const submitMarcoAction = async (
+// ── Per-round single photo upload ────────────────────────────────────────────
+
+export const submitRoundPhoto = async (roomId: string, round: number, file: File) => {
+  const uid = requireUid();
+  const path = `marcophotos/${roomId}/${uid}/round/${round}`;
+  const url = await uploadPhoto(path, file);
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  await updateDoc(roundRef, { [`submissions.${uid}`]: url });
+  return url;
+};
+
+// Client-side fallback: advances upload → elimination when all players have submitted.
+// Idempotent — safe to call from every client simultaneously.
+export const advanceRoundToElimination = async (roomId: string, round: number) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const roomRef = doc(db, "rooms", roomId);
+  return runTransaction(db, async (tx) => {
+    const roundSnap = await tx.get(roundRef);
+    if (!roundSnap.exists()) return;
+    const rd = roundSnap.data() as RoundData;
+    // "action" is the legacy round phase name used by older deployed Cloud Functions
+    if (rd.roundPhase !== "upload" && rd.roundPhase !== "action") return;
+    const roomSnap = await tx.get(roomRef);
+    if (!roomSnap.exists()) return;
+    const rm = roomSnap.data() as RoomData;
+    const totalPlayers = rm.playerCount ?? 0;
+    if (totalPlayers < 1) return;
+    const submissions = rd.submissions ?? {};
+    if (Object.keys(submissions).length < totalPlayers) return;
+    tx.update(roundRef, { roundPhase: "elimination" });
+    tx.update(roomRef, { gamePhase: "round-elimination", lastActiveAt: serverTimestamp() });
+  });
+};
+
+// Client-side fallback: advances elimination → eliminated-reveal (clue phase) once all Marcos confirmed.
+// Also writes the private/reveal doc so the eliminated player can see Marco's photo.
+export const advanceRoundFromElimination = async (roomId: string, round: number) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const roomRef = doc(db, "rooms", roomId);
+  const privateRef = doc(db, "rooms", roomId, "rounds", String(round), "private", "reveal");
+  return runTransaction(db, async (tx) => {
+    const roundSnap = await tx.get(roundRef);
+    if (!roundSnap.exists()) return;
+    const rd = roundSnap.data() as RoundData;
+    if (rd.roundPhase !== "elimination") return;
+    const roomSnap = await tx.get(roomRef);
+    if (!roomSnap.exists()) return;
+    const rm = roomSnap.data() as RoomData;
+    const marcoCount = rm.marcoCount ?? 1;
+    const confirmed = rd.marcoConfirmed ?? [];
+    if (confirmed.length < marcoCount) return;
+    const marcoSubmission = rd.marcoSubmission;
+    if (!marcoSubmission) return;
+    const { eliminatedPlayerId, marcoPlayerId } = marcoSubmission;
+    const marcoPhotoUrl = (rd.submissions ?? {})[marcoPlayerId] ?? null;
+    if (!marcoPhotoUrl) return;
+    const newEliminatedIds = [...(rm.eliminatedPlayerIds ?? []), eliminatedPlayerId];
+    tx.set(privateRef, { marcoPhotoUrl, forPlayerId: eliminatedPlayerId });
+    tx.update(roundRef, { roundPhase: "clue", eliminatedPlayerId });
+    tx.update(roomRef, { gamePhase: "eliminated-reveal", eliminatedPlayerIds: newEliminatedIds, lastActiveAt: serverTimestamp() });
+  });
+};
+
+// Client-side fallback: advances clue → photo-reveal once eliminated player submits clue word.
+export const advanceRoundFromClue = async (roomId: string, round: number) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const roomRef = doc(db, "rooms", roomId);
+  return runTransaction(db, async (tx) => {
+    const roundSnap = await tx.get(roundRef);
+    if (!roundSnap.exists()) return;
+    const rd = roundSnap.data() as RoundData;
+    if (rd.roundPhase !== "clue") return;
+    if (!rd.selectedClue) return;
+    tx.update(roundRef, { roundPhase: "reveal" });
+    tx.update(roomRef, { gamePhase: "photo-reveal", lastActiveAt: serverTimestamp() });
+  });
+};
+
+// Client-side fallback: advances reveal → investigation once any player signals ready.
+export const advanceRoundFromReveal = async (roomId: string, round: number) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const roomRef = doc(db, "rooms", roomId);
+  return runTransaction(db, async (tx) => {
+    const roundSnap = await tx.get(roundRef);
+    if (!roundSnap.exists()) return;
+    const rd = roundSnap.data() as RoundData;
+    if (rd.roundPhase !== "reveal") return;
+    if (!rd.advanceToInvestigation) return;
+    tx.update(roundRef, { roundPhase: "vote" });
+    tx.update(roomRef, { gamePhase: "investigation", lastActiveAt: serverTimestamp() });
+  });
+};
+
+// Client-side fallback: advances vote → done/next-round once all eligible players have voted.
+export const advanceRoundFromVote = async (
+  roomId: string,
+  round: number,
+  players: RoomPlayer[],
+) => {
+  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
+  const roomRef = doc(db, "rooms", roomId);
+  return runTransaction(db, async (tx) => {
+    const roundSnap = await tx.get(roundRef);
+    if (!roundSnap.exists()) return;
+    const rd = roundSnap.data() as RoundData;
+    if (rd.roundPhase !== "vote") {
+      // Old CF already advanced this round. Ensure the next round has a theme
+      // (the old CF creates round docs without a theme field).
+      const roomSnap = await tx.get(roomRef);
+      if (!roomSnap.exists()) return;
+      const rm = roomSnap.data() as RoomData;
+      const nextRound = rm.currentRound ?? 1;
+      if (nextRound > round) {
+        const nextRoundRef = doc(db, "rooms", roomId, "rounds", String(nextRound));
+        const nextSnap = await tx.get(nextRoundRef);
+        if (nextSnap.exists()) {
+          const nextRd = nextSnap.data() as RoundData;
+          // The old CF creates round docs without theme or clueOptions — patch both if missing.
+          const patch: Record<string, unknown> = {};
+          if (!nextRd.theme) patch.theme = THEMES[Math.floor(Math.random() * THEMES.length)];
+          if (!nextRd.clueOptions || (nextRd.clueOptions as string[]).length === 0) patch.clueOptions = pickClueOptions(10);
+          if (Object.keys(patch).length > 0) tx.update(nextRoundRef, patch);
+        }
+      }
+      return;
+    }
+    const roomSnap = await tx.get(roomRef);
+    if (!roomSnap.exists()) return;
+    const rm = roomSnap.data() as RoomData;
+    const eliminatedIds = rm.eliminatedPlayerIds ?? [];
+    const eligibleVoters = players.filter((p) => !eliminatedIds.includes(p.id));
+    const votes = rd.investigationVotes ?? {};
+    if (Object.keys(votes).length < eligibleVoters.length) return;
+
+    // Tally votes
+    const tallies: Record<string, number> = {};
+    for (const targetId of Object.values(votes)) {
+      tallies[targetId] = (tallies[targetId] ?? 0) + 1;
+    }
+    let maxVotes = 0;
+    let topTargets: string[] = [];
+    for (const [targetId, count] of Object.entries(tallies)) {
+      if (count > maxVotes) { maxVotes = count; topTargets = [targetId]; }
+      else if (count === maxVotes) { topTargets.push(targetId); }
+    }
+    const investigatedPlayerId = topTargets.length === 1 ? topTargets[0] : null;
+    const currentInvestigated = rm.investigatedPlayerIds ?? [];
+    const newInvestigatedIds = investigatedPlayerId
+      ? [...currentInvestigated, investigatedPlayerId]
+      : currentInvestigated;
+
+    const marcoIds = players.filter((p) => p.role === "Marco").map((p) => p.id);
+    const allMarcosInvestigated = marcoIds.length > 0 && marcoIds.every((id) => newInvestigatedIds.includes(id));
+    const currentRound = rm.currentRound ?? 1;
+    const roundLimit = rm.rounds ?? 2;
+
+    tx.update(roundRef, { roundPhase: "done", investigatedPlayerId: investigatedPlayerId ?? null });
+
+    if (allMarcosInvestigated) {
+      tx.update(roomRef, { gamePhase: "game-over", winner: "Reg", investigatedPlayerIds: newInvestigatedIds, lastActiveAt: serverTimestamp() });
+    } else if (currentRound >= roundLimit) {
+      tx.update(roomRef, { gamePhase: "game-over", winner: "Marco", investigatedPlayerIds: newInvestigatedIds, lastActiveAt: serverTimestamp() });
+    } else {
+      const nextRound = currentRound + 1;
+      const theme = THEMES[Math.floor(Math.random() * THEMES.length)];
+      const clueOptions = pickClueOptions(10);
+      const nextRoundRef = doc(db, "rooms", roomId, "rounds", String(nextRound));
+      tx.set(nextRoundRef, {
+        roundPhase: "upload", theme, clueOptions,
+        submissions: {}, marcoSubmission: null, marcoConfirmed: [],
+        eliminatedPlayerId: null, selectedClue: null,
+        investigationVotes: {}, investigatedPlayerId: null, advanceToInvestigation: false,
+      });
+      tx.update(roomRef, { gamePhase: "round-upload", currentRound: nextRound, investigatedPlayerIds: newInvestigatedIds, lastActiveAt: serverTimestamp() });
+    }
+  });
+};
+
+// ── Marco elimination actions ─────────────────────────────────────────────────
+
+export const submitMarcoElimination = async (
   roomId: string,
   round: number,
   eliminatedPlayerId: string,
-  privatePhotoUrl: string,
-  publicPhotoUrl: string,
 ) => {
   const uid = requireUid();
   const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
-  const playerRef = doc(db, "rooms", roomId, "players", uid);
-  // Submitting counts as confirming your own proposal; reset other confirmations
   await updateDoc(roundRef, {
-    [`marcoSubmissions.${uid}`]: { eliminatedPlayerId, privatePhotoUrl, publicPhotoUrl },
+    marcoSubmission: { eliminatedPlayerId, marcoPlayerId: uid },
     marcoConfirmed: [uid],
   });
-  await updateDoc(playerRef, {
-    usedPhotoUrls: arrayUnion(privatePhotoUrl, publicPhotoUrl),
-  });
 };
 
-export const confirmMarcoAction = async (roomId: string, round: number) => {
+export const confirmMarcoElimination = async (roomId: string, round: number) => {
   const uid = requireUid();
   const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
-  await updateDoc(roundRef, {
-    marcoConfirmed: arrayUnion(uid),
-  });
+  await updateDoc(roundRef, { marcoConfirmed: arrayUnion(uid) });
 };
 
-export const submitRegPhoto = async (
-  roomId: string,
-  round: number,
-  photoUrl: string,
-) => {
-  const uid = requireUid();
+// ── Eliminated player clue word ───────────────────────────────────────────────
+
+export const submitClueWord = async (roomId: string, round: number, word: string) => {
   const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
-  const playerRef = doc(db, "rooms", roomId, "players", uid);
-  await updateDoc(roundRef, {
-    [`publicPhotoUrls.${uid}`]: photoUrl,
-  });
-  await updateDoc(playerRef, {
-    usedPhotoUrls: arrayUnion(photoUrl),
-  });
+  await updateDoc(roundRef, { selectedClue: word });
 };
 
-export const submitMarcoPublicPhoto = async (
-  roomId: string,
-  round: number,
-  photoUrl: string,
-) => {
-  const uid = requireUid();
-  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
-  const playerRef = doc(db, "rooms", roomId, "players", uid);
-  await updateDoc(roundRef, {
-    [`publicPhotoUrls.${uid}`]: photoUrl,
-  });
-  await updateDoc(playerRef, {
-    usedPhotoUrls: arrayUnion(photoUrl),
-  });
-};
-
-export const submitEliminatedClue = async (
-  roomId: string,
-  round: number,
-  clue: string,
-) => {
-  const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
-  await updateDoc(roundRef, { eliminatedClue: clue });
-};
+// ── Shared round actions ──────────────────────────────────────────────────────
 
 export const advanceToInvestigation = async (roomId: string, round: number) => {
   const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
@@ -452,38 +535,36 @@ export const submitInvestigationVote = async (
 ) => {
   const uid = requireUid();
   const roundRef = doc(db, "rooms", roomId, "rounds", String(round));
-  await updateDoc(roundRef, {
-    [`investigationVotes.${uid}`]: targetUid,
-  });
+  await updateDoc(roundRef, { [`investigationVotes.${uid}`]: targetUid });
 };
+
+// ── Start game ────────────────────────────────────────────────────────────────
 
 export const startGame = async (roomId: string) => {
   requireUid();
   const roomRef = doc(db, "rooms", roomId);
   const playersRef = collection(db, "rooms", roomId, "players");
 
+  // Pick theme + clue options before the transaction — safe because the
+  // transaction guard ensures only one client's transaction proceeds.
+  const theme = THEMES[Math.floor(Math.random() * THEMES.length)];
+  const clueOptions = pickClueOptions(10);
+  const round1Ref = doc(db, "rooms", roomId, "rounds", "1");
+
   return runTransaction(db, async (tx) => {
     const roomSnap = await tx.get(roomRef);
-    if (!roomSnap.exists()) {
-      throw new Error("Room not found.");
-    }
+    if (!roomSnap.exists()) throw new Error("Room not found.");
     const roomData = roomSnap.data() as RoomData;
 
     // Guard: if another client's transaction already started the game, bail out.
-    // Without this, all clients run concurrent transactions with different shuffles
-    // and the last one to commit overwrites the Marco assignment, resulting in all Regs.
     if (roomData.state === "playing") return;
 
     const playersSnap = await getDocs(query(playersRef, orderBy("joinedAt", "asc")));
-    if (playersSnap.size < 4) {
-      throw new Error("Need at least 4 players to start.");
-    }
+    if (playersSnap.size < 4) throw new Error("Need at least 4 players to start.");
     const everyoneReady = playersSnap.docs.every((d) => d.data().isReady === true);
-    if (!everyoneReady) {
-      throw new Error("All players must be ready first.");
-    }
+    if (!everyoneReady) throw new Error("All players must be ready first.");
 
-    const { marcoCount, rounds, photosPerPlayer } = getGameConfig(playersSnap.size);
+    const { marcoCount, rounds } = getGameConfig(playersSnap.size);
     const shuffledIds = fisherYatesShuffle(playersSnap.docs.map((d) => d.id));
 
     for (let i = 0; i < shuffledIds.length; i++) {
@@ -491,18 +572,30 @@ export const startGame = async (roomId: string) => {
       tx.update(playerRef, { role: i < marcoCount ? "Marco" : "Reg" });
     }
 
-    // Reset all stale game state from any previous game so old eliminated players
-    // and round data can't bleed into the new game (fixes: old eliminatedPlayerIds showing).
+    // Create round 1 doc atomically with the game start
+    tx.set(round1Ref, {
+      roundPhase: "upload",
+      theme,
+      clueOptions,
+      submissions: {},
+      marcoSubmission: null,
+      marcoConfirmed: [],
+      eliminatedPlayerId: null,
+      selectedClue: null,
+      investigationVotes: {},
+      investigatedPlayerId: null,
+      advanceToInvestigation: false,
+    });
+
     tx.update(roomRef, {
       state: "playing",
       marcoCount,
       rounds,
-      photosPerPlayer,
-      gamePhase: deleteField(),
-      currentRound: deleteField(),
-      eliminatedPlayerIds: deleteField(),
-      investigatedPlayerIds: deleteField(),
-      winner: deleteField(),
+      gamePhase: "round-upload",
+      currentRound: 1,
+      eliminatedPlayerIds: [],
+      investigatedPlayerIds: [],
+      winner: null,
       lastActiveAt: serverTimestamp(),
     });
   });

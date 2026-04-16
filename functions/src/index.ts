@@ -13,6 +13,34 @@ const WAITING_PLAYER_TIMEOUT_MS = 10 * 60 * 1000;
 const GAME_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 const VOTE_KICK_MIN_THRESHOLD = 2;
 
+// ── Shared game constants (mirrored from src/lib/gameConstants.ts) ────────────
+
+const THEMES = [
+  "Nature", "Food & Drink", "Architecture", "Night Life", "Travel",
+  "Everyday Life", "Art & Culture", "Sports & Fitness", "Weather",
+  "Urban Streets", "Water & Ocean", "Celebrations", "Work & Study",
+  "Family & Friends", "Pets & Animals", "Sunsets & Skies", "Markets & Shops",
+  "Texture & Patterns", "Motion & Speed", "Silence & Stillness",
+];
+
+const CLUE_BANK = [
+  "calm", "tense", "lonely", "joyful", "awkward", "nostalgic", "hopeful", "uneasy",
+  "broken", "messy", "clean", "dark", "bright", "fragile", "worn", "fresh",
+  "hidden", "open", "empty", "crowded", "weird", "normal", "lost", "found",
+  "moving", "still", "waiting", "rushing", "stuck", "fleeting", "heavy", "light",
+  "sharp", "blurry", "loud", "quiet", "rough", "smooth", "warm", "cold",
+  "together", "apart", "watched", "ignored", "contained", "free", "grounded", "floating",
+];
+
+const pickClueOptions = (n: number): string[] => {
+  const shuffled = [...CLUE_BANK].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, n);
+};
+
+const pickTheme = (): string => THEMES[Math.floor(Math.random() * THEMES.length)];
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
 type RoomDataServer = {
   state?: string;
   gamePhase?: string;
@@ -25,39 +53,61 @@ type RoomDataServer = {
   waitingSince?: Timestamp | null;
 };
 
-type MarcoSubmission = {
-  eliminatedPlayerId: string;
-  privatePhotoUrl: string;
-  publicPhotoUrl: string;
-};
-
 type RoundDataServer = {
   roundPhase?: string;
-  eliminatedPlayerId?: string | null;
-  privatePhotoUrl?: string | null;
-  marcoSubmissions?: Record<string, MarcoSubmission>;
+  theme?: string;
+  clueOptions?: string[];
+  submissions?: Record<string, string>;
+  marcoSubmission?: { eliminatedPlayerId: string; marcoPlayerId: string } | null;
   marcoConfirmed?: string[];
-  publicPhotoUrls?: Record<string, string>;
-  eliminatedClue?: string | null;
+  eliminatedPlayerId?: string | null;
+  selectedClue?: string | null;
   investigationVotes?: Record<string, string>;
   investigatedPlayerId?: string | null;
   advanceToInvestigation?: boolean;
 };
 
-const makeEmptyRound = () => ({
-  roundPhase: "action",
-  eliminatedPlayerId: null,
-  privatePhotoUrl: null,
-  marcoSubmissions: {},
+const makeEmptyRound = (theme: string, clueOptions: string[]) => ({
+  roundPhase: "upload",
+  theme,
+  clueOptions,
+  submissions: {},
+  marcoSubmission: null,
   marcoConfirmed: [],
-  publicPhotoUrls: {},
-  eliminatedClue: null,
+  eliminatedPlayerId: null,
+  selectedClue: null,
   investigationVotes: {},
   investigatedPlayerId: null,
   advanceToInvestigation: false,
 });
 
-// ── Room stats ──────────────────────────────────────────────────────────────
+const sendDebugLog = (
+  hypothesisId: string,
+  location: string,
+  message: string,
+  data: Record<string, unknown>,
+) => {
+  // #region agent log
+  fetch("http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "d485e8",
+    },
+    body: JSON.stringify({
+      sessionId: "d485e8",
+      runId: "repro2",
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+};
+
+// ── Room stats ───────────────────────────────────────────────────────────────
 
 export const onRoomCreated = onDocumentCreated("rooms/{roomId}", async () => {
   await db.doc("stats/rooms").set(
@@ -73,13 +123,13 @@ export const onRoomDeleted = onDocumentDeleted("rooms/{roomId}", async () => {
   );
 });
 
-// ── Votekick: server-side player removal ────────────────────────────────────
+// ── Votekick: server-side player removal ─────────────────────────────────────
 
 export const onPlayerVotekickUpdated = onDocumentUpdated(
   "rooms/{roomId}/players/{playerId}",
   async (event) => {
-    const before = event.data?.before.data() as { votekickCount?: number; hasUploadedPhotos?: boolean } | undefined;
-    const after = event.data?.after.data() as { votekickCount?: number; hasUploadedPhotos?: boolean } | undefined;
+    const before = event.data?.before.data() as { votekickCount?: number } | undefined;
+    const after = event.data?.after.data() as { votekickCount?: number } | undefined;
     if (!before || !after) return;
 
     const beforeCount = before.votekickCount ?? 0;
@@ -115,7 +165,7 @@ export const onPlayerVotekickUpdated = onDocumentUpdated(
   },
 );
 
-// ── Votekick count reset when room goes back to waiting ─────────────────────
+// ── Reset when room goes back to waiting ─────────────────────────────────────
 
 export const onRoomStateChanged = onDocumentUpdated("rooms/{roomId}", async (event) => {
   const before = event.data?.before.data() as { state?: string } | undefined;
@@ -130,33 +180,19 @@ export const onRoomStateChanged = onDocumentUpdated("rooms/{roomId}", async (eve
   const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
   const batch = db.batch();
 
-  // Always reset votekick data on all remaining players
   for (const playerDoc of playersSnap.docs) {
-    const playerData = playerDoc.data() as {
-      votekickCount?: number;
-      role?: string;
-      photoUrls?: unknown;
-      usedPhotoUrls?: unknown;
-      hasUploadedPhotos?: unknown;
-    };
+    const playerData = playerDoc.data() as { votekickCount?: number; role?: string };
     const playerUpdates: Record<string, unknown> = {};
     if ((playerData.votekickCount ?? 0) > 0) playerUpdates.votekickCount = 0;
-    // Clear game-specific fields if the game was in progress
     if (wasPlaying) {
       if (playerData.role !== undefined) playerUpdates.role = FieldValue.delete();
-      if (playerData.photoUrls !== undefined) playerUpdates.photoUrls = FieldValue.delete();
-      if (playerData.usedPhotoUrls !== undefined) playerUpdates.usedPhotoUrls = FieldValue.delete();
-      if (playerData.hasUploadedPhotos !== undefined) playerUpdates.hasUploadedPhotos = FieldValue.delete();
       playerUpdates.isReady = false;
     }
-    if (Object.keys(playerUpdates).length > 0) {
-      batch.update(playerDoc.ref, playerUpdates);
-    }
+    if (Object.keys(playerUpdates).length > 0) batch.update(playerDoc.ref, playerUpdates);
     const votesSnap = await playerDoc.ref.collection("votes").get();
     for (const voteDoc of votesSnap.docs) batch.delete(voteDoc.ref);
   }
 
-  // Clear game fields from the room doc
   if (wasPlaying) {
     batch.update(roomRef, {
       gamePhase: FieldValue.delete(),
@@ -173,8 +209,26 @@ export const onRoomStateChanged = onDocumentUpdated("rooms/{roomId}", async (eve
 
   await batch.commit();
 
-  // Delete all photos uploaded for this room from Storage
   if (wasPlaying) {
+    // Delete all round subdocs so the next game starts with a clean slate
+    try {
+      const roundsSnap = await db.collection(`rooms/${roomId}/rounds`).get();
+      if (!roundsSnap.empty) {
+        const roundBatch = db.batch();
+        for (const roundDoc of roundsSnap.docs) {
+          // Delete private subcollection docs first
+          const privateSnap = await roundDoc.ref.collection("private").get();
+          for (const privateDoc of privateSnap.docs) roundBatch.delete(privateDoc.ref);
+          roundBatch.delete(roundDoc.ref);
+        }
+        await roundBatch.commit();
+        console.log(`[onRoomStateChanged] deleted ${roundsSnap.size} round doc(s) for ${roomId}`);
+      }
+    } catch (err) {
+      console.warn(`[onRoomStateChanged] failed to delete round docs for ${roomId}:`, err);
+    }
+
+    // Delete all photos uploaded for this room from Storage
     try {
       const bucket = getStorage().bucket();
       await bucket.deleteFiles({ prefix: `marcophotos/${roomId}/` });
@@ -185,47 +239,7 @@ export const onRoomStateChanged = onDocumentUpdated("rooms/{roomId}", async (eve
   }
 });
 
-// ── Photo upload complete → start round 1 ───────────────────────────────────
-
-export const onPlayerPhotosUploaded = onDocumentUpdated(
-  "rooms/{roomId}/players/{playerId}",
-  async (event) => {
-    const before = event.data?.before.data() as { hasUploadedPhotos?: boolean } | undefined;
-    const after = event.data?.after.data() as { hasUploadedPhotos?: boolean } | undefined;
-    if (!before || !after) return;
-    if (before.hasUploadedPhotos === after.hasUploadedPhotos) return;
-    if (!after.hasUploadedPhotos) return;
-
-    const { roomId } = event.params;
-    const roomRef = db.doc(`rooms/${roomId}`);
-    const roomSnap = await roomRef.get();
-    if (!roomSnap.exists) return;
-
-    const roomData = roomSnap.data() as RoomDataServer;
-    if (roomData.state !== "playing" || roomData.gamePhase) return;
-
-    const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
-    const allUploaded = playersSnap.docs.every((d) => d.data().hasUploadedPhotos === true);
-    if (!allUploaded) {
-      console.log(`[onPlayerPhotosUploaded] waiting for more players to upload`);
-      return;
-    }
-
-    const round1Ref = db.doc(`rooms/${roomId}/rounds/1`);
-    await round1Ref.set(makeEmptyRound());
-    await roomRef.update({
-      gamePhase: "round-action",
-      currentRound: 1,
-      eliminatedPlayerIds: [],
-      investigatedPlayerIds: [],
-      winner: null,
-      lastActiveAt: FieldValue.serverTimestamp(),
-    });
-    console.log(`[onPlayerPhotosUploaded] all uploaded — round 1 started for ${roomId}`);
-  },
-);
-
-// ── Round doc phase transitions ──────────────────────────────────────────────
+// ── Round doc phase transitions ───────────────────────────────────────────────
 
 export const onRoundDocUpdated = onDocumentUpdated(
   "rooms/{roomId}/rounds/{roundNum}",
@@ -241,34 +255,63 @@ export const onRoundDocUpdated = onDocumentUpdated(
     if (!roomSnap.exists) return;
     const roomData = roomSnap.data() as RoomDataServer;
 
-    // ── Phase 1 → 2: all Marcos confirmed + all active Regs submitted ────────
-    if (after.roundPhase === "action") {
+    // ── Phase 1: upload → elimination ────────────────────────────────────────
+    if (after.roundPhase === "upload") {
+      const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
+      const submissions = after.submissions ?? {};
+      const totalPlayers = playersSnap.size;
+      // #region agent log — Firestore breadcrumb readable by client
+      await roundRef.update({
+        _dbgFunctionRan: {
+          at: FieldValue.serverTimestamp(),
+          uploadCount: Object.keys(submissions).length,
+          totalPlayers,
+          roundPhase: after.roundPhase ?? null,
+        },
+      }).catch(() => {});
+      // #endregion
+
+      if (Object.keys(submissions).length < totalPlayers) return;
+
+      console.log(`[onRoundDocUpdated] All photos submitted — advancing to elimination, round ${roundNum}`);
+      const batch = db.batch();
+      batch.update(roundRef, { roundPhase: "elimination" });
+      batch.update(roomRef, { gamePhase: "round-elimination", lastActiveAt: FieldValue.serverTimestamp() });
+      await batch.commit();
+      return;
+    }
+
+    // ── Phase 2: elimination → clue ──────────────────────────────────────────
+    if (after.roundPhase === "elimination") {
       const marcoCount = roomData.marcoCount ?? 1;
       const confirmed = after.marcoConfirmed ?? [];
       if (confirmed.length < marcoCount) return;
 
-      const confirmedMarcoId = confirmed[0];
-      const confirmedSubmission = after.marcoSubmissions?.[confirmedMarcoId];
-      if (!confirmedSubmission) return;
+      const marcoSubmission = after.marcoSubmission;
+      if (!marcoSubmission) return;
 
-      const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
+      const { eliminatedPlayerId, marcoPlayerId } = marcoSubmission;
+      const submissions = after.submissions ?? {};
+      const marcoPhotoUrl = submissions[marcoPlayerId] ?? null;
+
+      if (!marcoPhotoUrl) {
+        console.warn(`[onRoundDocUpdated] Marco ${marcoPlayerId} has no submission, cannot advance`);
+        return;
+      }
+
       const eliminatedIds = roomData.eliminatedPlayerIds ?? [];
-      const activeRegs = playersSnap.docs.filter(
-        (d) => d.data().role !== "Marco" && !eliminatedIds.includes(d.id),
-      );
-      const publicPhotoUrls = after.publicPhotoUrls ?? {};
-      const allRegsSubmitted = activeRegs.every((d) => !!publicPhotoUrls[d.id]);
-      if (!allRegsSubmitted) return;
+      const newEliminatedIds = [...eliminatedIds, eliminatedPlayerId];
 
-      console.log(`[onRoundDocUpdated] All actions complete — advancing to clue, round ${roundNum}`);
-      const newEliminatedIds = [...eliminatedIds, confirmedSubmission.eliminatedPlayerId];
-
+      console.log(`[onRoundDocUpdated] Marco action confirmed — advancing to clue, round ${roundNum}`);
       const batch = db.batch();
+
+      // Write private doc readable only by the eliminated player
+      const privateRef = db.doc(`rooms/${roomId}/rounds/${roundNum}/private/reveal`);
+      batch.set(privateRef, { marcoPhotoUrl, forPlayerId: eliminatedPlayerId });
+
       batch.update(roundRef, {
         roundPhase: "clue",
-        eliminatedPlayerId: confirmedSubmission.eliminatedPlayerId,
-        privatePhotoUrl: confirmedSubmission.privatePhotoUrl,
-        [`publicPhotoUrls.${confirmedMarcoId}`]: confirmedSubmission.publicPhotoUrl,
+        eliminatedPlayerId,
       });
       batch.update(roomRef, {
         gamePhase: "eliminated-reveal",
@@ -279,8 +322,8 @@ export const onRoundDocUpdated = onDocumentUpdated(
       return;
     }
 
-    // ── Phase 2 → 3: eliminated clue submitted ───────────────────────────────
-    if (after.roundPhase === "clue" && !before.eliminatedClue && after.eliminatedClue) {
+    // ── Phase 3: clue → reveal ───────────────────────────────────────────────
+    if (after.roundPhase === "clue" && !before.selectedClue && after.selectedClue) {
       console.log(`[onRoundDocUpdated] Clue submitted — advancing to reveal, round ${roundNum}`);
       const batch = db.batch();
       batch.update(roundRef, { roundPhase: "reveal" });
@@ -289,7 +332,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
       return;
     }
 
-    // ── Phase 3 → 4: advance to investigation ────────────────────────────────
+    // ── Phase 4: reveal → vote ───────────────────────────────────────────────
     if (after.roundPhase === "reveal" && after.advanceToInvestigation && !before.advanceToInvestigation) {
       console.log(`[onRoundDocUpdated] Advancing to investigation, round ${roundNum}`);
       const batch = db.batch();
@@ -299,7 +342,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
       return;
     }
 
-    // ── Phase 4: tally investigation votes ───────────────────────────────────
+    // ── Phase 5: vote → done ─────────────────────────────────────────────────
     if (after.roundPhase === "vote") {
       const votes = after.investigationVotes ?? {};
       const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
@@ -308,7 +351,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
 
       if (Object.keys(votes).length < eligibleVoters.length) return;
 
-      // Tally
+      // Tally votes
       const tallies: Record<string, number> = {};
       for (const targetId of Object.values(votes)) {
         tallies[targetId] = (tallies[targetId] ?? 0) + 1;
@@ -331,7 +374,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
         .map((d) => d.id);
       const allMarcosInvestigated = marcoIds.every((id) => newInvestigatedIds.includes(id));
       const currentRound = roomData.currentRound ?? 1;
-      const roundLimit = roomData.rounds ?? 3;
+      const roundLimit = roomData.rounds ?? 2;
 
       console.log(`[onRoundDocUpdated] Votes tallied, round ${roundNum}. Tie=${isTie}, investigated=${investigatedPlayerId}`);
 
@@ -356,11 +399,13 @@ export const onRoundDocUpdated = onDocumentUpdated(
         });
       } else {
         const nextRound = currentRound + 1;
-        console.log(`[onRoundDocUpdated] Starting round ${nextRound}`);
+        const nextTheme = pickTheme();
+        const nextClueOptions = pickClueOptions(10);
+        console.log(`[onRoundDocUpdated] Starting round ${nextRound} — theme: ${nextTheme}`);
         const nextRoundRef = db.doc(`rooms/${roomId}/rounds/${nextRound}`);
-        batch.set(nextRoundRef, makeEmptyRound());
+        batch.set(nextRoundRef, makeEmptyRound(nextTheme, nextClueOptions));
         batch.update(roomRef, {
-          gamePhase: "round-action",
+          gamePhase: "round-upload",
           currentRound: nextRound,
           investigatedPlayerIds: newInvestigatedIds,
           lastActiveAt: FieldValue.serverTimestamp(),
@@ -375,9 +420,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
 
 export const cleanupRooms = onSchedule("every 1 minutes", async () => {
   const presenceCutoff = Timestamp.fromDate(new Date(Date.now() - PRESENCE_TIMEOUT_MS));
-  const waitingPlayerCutoff = Timestamp.fromDate(
-    new Date(Date.now() - WAITING_PLAYER_TIMEOUT_MS),
-  );
+  const waitingPlayerCutoff = Timestamp.fromDate(new Date(Date.now() - WAITING_PLAYER_TIMEOUT_MS));
   const mainRoomRef = db.collection("rooms").doc(MAIN_ROOM_ID);
   const mainRoomSnap = await mainRoomRef.get();
   if (!mainRoomSnap.exists) {

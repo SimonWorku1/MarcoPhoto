@@ -1,25 +1,30 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BubbleButton } from "./components/BubbleButton";
+import { RoundProgressBar } from "./components/RoundProgressBar";
 import logo from "../assets/bc1bc1c44f6ba6cb1fd8be782ee33922cc6339af.png";
 import { auth, ensureAnonymousAuth } from "../lib/firebase";
 import {
+  advanceRoundFromClue,
+  advanceRoundFromElimination,
+  advanceRoundFromReveal,
+  advanceRoundFromVote,
+  advanceRoundToElimination,
   advanceToInvestigation,
-  confirmMarcoAction,
+  confirmMarcoElimination,
   getActiveRoomId,
-  getGameConfig,
   joinMainRoom,
   leaveRoom,
   listenRoom,
   listenRoomPlayers,
   listenRound,
+  listenRoundPrivate,
   setPlayerReady,
   startGame,
-  submitEliminatedClue,
+  submitClueWord,
   submitInvestigationVote,
-  submitMarcoAction,
-  submitRegPhoto,
+  submitMarcoElimination,
+  submitRoundPhoto,
   touchPlayer,
-  uploadPhotoPool,
   upsertUserProfile,
   voteKickPlayer,
   type RoomData,
@@ -40,9 +45,10 @@ import {
 type GameScreen =
   | "menu"
   | "lobby"
-  | "photo-upload"
   | "role-reveal"
-  | "round-action"
+  | "round-theme"
+  | "round-upload"
+  | "round-elimination"
   | "eliminated-reveal"
   | "photo-reveal"
   | "investigation"
@@ -127,7 +133,6 @@ async function ensureJpeg(file: File): Promise<File> {
     file.name.toLowerCase().endsWith(".heic") ||
     file.name.toLowerCase().endsWith(".heif");
   if (!isHeic) return file;
-  // Safari supports HEIC/HEIF natively; Chrome does not.
   let bitmap: ImageBitmap;
   try {
     bitmap = await createImageBitmap(file);
@@ -163,34 +168,49 @@ export default function App() {
   const [isBusy, setIsBusy] = useState(false);
   const [kickCandidate, setKickCandidate] = useState<RoomPlayer | null>(null);
 
-  // Photo upload state
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [uploadFiles, setUploadFiles] = useState<File[] | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  // Per-round single photo upload
+  const roundPhotoInputRef = useRef<HTMLInputElement>(null);
+  const [roundPhotoFile, setRoundPhotoFile] = useState<File | null>(null);
+  const [isRoundUploading, setIsRoundUploading] = useState(false);
+  const [roundUploadError, setRoundUploadError] = useState<string | null>(null);
 
-  // Marco action state
-  const [marcoTargetId, setMarcoTargetId] = useState<string | null>(null);
-  const [marcoPrivatePhoto, setMarcoPrivatePhoto] = useState<string | null>(null);
-  const [marcoPublicPhoto, setMarcoPublicPhoto] = useState<string | null>(null);
+  // Marco elimination state
+  const [marcoEliminationTarget, setMarcoEliminationTarget] = useState<string | null>(null);
 
-  // Reg action state
-  const [regPublicPhoto, setRegPublicPhoto] = useState<string | null>(null);
+  // Eliminated player clue selection
+  const [selectedClueWord, setSelectedClueWord] = useState<string | null>(null);
 
-  // Eliminated clue state
-  const [clueInput, setClueInput] = useState("");
+  // Private reveal data (Marco photo URL shown only to eliminated player)
+  const [privateRevealData, setPrivateRevealData] = useState<{
+    marcoPhotoUrl: string;
+    forPlayerId: string;
+  } | null>(null);
 
-  // Investigation vote state
+  // Client-side theme reveal gate: track which round's theme has been acknowledged
+  const [themeAcknowledgedRound, setThemeAcknowledgedRound] = useState(0);
+
+  // Investigation vote state + persisted result for the result screen
   const [myVote, setMyVote] = useState<string | null>(null);
+  const [savedInvestigatedPlayerId, setSavedInvestigatedPlayerId] = useState<string | null>(null);
+  const [savedVoteComplete, setSavedVoteComplete] = useState(false);
 
   // Rules modal state
   const [showRules, setShowRules] = useState(false);
+  const [rulesTab, setRulesTab] = useState<"rules" | "setup" | "flow">("rules");
 
-  // Math question state (for Regs/eliminated during round-action)
+  // Math question state (busywork for non-Marco players during round-elimination)
   const [mathQ, setMathQ] = useState<MathQuestion>(() => createMathQuestion());
   const [mathInput, setMathInput] = useState("");
   const [mathScore, setMathScore] = useState(0);
   const [mathFeedback, setMathFeedback] = useState<"correct" | null>(null);
+  const debugLastRoomSigRef = useRef<string>("");
+  const debugLastRoundSigRef = useRef<string>("");
+  const debugLastScreenSigRef = useRef<string>("");
+  const debugLastMembershipSigRef = useRef<string>("");
+  // Tracks whether this client has been confirmed in the players list at least
+  // once for the current roomId. Used to distinguish "listener not yet loaded"
+  // (false positive) from "genuinely removed / kicked" (true positive).
+  const hasBeenInRoomRef = useRef(false);
 
   const uid = auth.currentUser?.uid;
   const currentPlayer = players.find((p) => p.id === uid) ?? null;
@@ -199,16 +219,16 @@ export default function App() {
   const canJoinGame = isNameSaved && isNameValid && authReady && !isBusy;
   const everyoneReady = players.length >= 4 && players.every((p) => p.isReady === true);
   const voteKickThreshold = Math.max(2, Math.ceil((players.length - 1) / 2));
-  const photosPerPlayer = room?.photosPerPlayer ?? getGameConfig(players.length).photosPerPlayer;
   const eliminatedIds = room?.eliminatedPlayerIds ?? [];
   const activePlayers = players.filter((p) => !eliminatedIds.includes(p.id));
   const isEliminated = uid ? eliminatedIds.includes(uid) : false;
-  const marcosAllConfirmed = (roundData?.marcoConfirmed?.length ?? 0) >= (room?.marcoCount ?? 1);
-  const availablePhotos = useMemo(() => {
-    const pool = currentPlayer?.photoUrls ?? [];
-    const used = new Set(currentPlayer?.usedPhotoUrls ?? []);
-    return pool.filter((url) => !used.has(url));
-  }, [currentPlayer?.photoUrls, currentPlayer?.usedPhotoUrls]);
+  const effectiveRole = (role ?? currentPlayer?.role ?? null) as Role | null;
+
+  // Marco elimination derived state
+  const existingProposal = roundData?.marcoSubmission ?? null;
+  const hasSubmitted = uid ? roundData?.marcoSubmission?.marcoPlayerId === uid : false;
+  const hasConfirmed = uid ? (roundData?.marcoConfirmed ?? []).includes(uid) : false;
+  const marcoEligibleTargets = activePlayers.filter((p) => p.role !== "Marco");
 
   // ── Auth setup ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -229,16 +249,11 @@ export default function App() {
         const activeRoomId = await getActiveRoomId();
         if (activeRoomId) {
           setRoomId(activeRoomId);
-          // Screen will be driven by room.gamePhase once the listener fires;
-          // start at lobby as a safe default — the phase transition effect updates it
           setScreen("lobby");
         }
       })
       .catch((err: Error) => {
-        if (isMounted) {
-          setAuthReady(false);
-          setError(err.message);
-        }
+        if (isMounted) { setAuthReady(false); setError(err.message); }
       });
     return () => { isMounted = false; };
   }, []);
@@ -254,17 +269,10 @@ export default function App() {
 
   // ── Room + players subscription ───────────────────────────────────────────
   useEffect(() => {
-    if (!roomId) {
-      setRoom(null);
-      setPlayers([]);
-      return;
-    }
+    if (!roomId) { setRoom(null); setPlayers([]); return; }
     const unsubRoom = listenRoom(roomId, (nextRoom) => {
       setRoom(nextRoom);
-      if (!nextRoom) {
-        setRoomId(null);
-        setScreen("menu");
-      }
+      if (!nextRoom) { setRoomId(null); setScreen("menu"); }
     });
     const unsubPlayers = listenRoomPlayers(roomId, setPlayers);
     return () => { unsubRoom(); unsubPlayers(); };
@@ -272,13 +280,183 @@ export default function App() {
 
   // ── Round subscription ────────────────────────────────────────────────────
   useEffect(() => {
-    if (!roomId || !room?.currentRound) {
-      setRoundData(null);
-      return;
-    }
+    if (!roomId || !room?.currentRound) { setRoundData(null); return; }
     const unsubRound = listenRound(roomId, room.currentRound, setRoundData);
     return () => unsubRound();
   }, [roomId, room?.currentRound]);
+
+  // ── Detect kick / clear: redirect to menu if removed from the room ────────
+  useEffect(() => {
+    if (!roomId || !uid || !room) {
+      // Room gone or not yet joined — reset the confirmation flag.
+      hasBeenInRoomRef.current = false;
+      return;
+    }
+    const isInRoom = players.some((p) => p.id === uid);
+    if (isInRoom) {
+      // Confirmed present — flag that we've genuinely been in this room.
+      hasBeenInRoomRef.current = true;
+      return;
+    }
+    // Not in the players list. Only act if we were confirmed in the room before
+    // (guards against the brief window after setRoomId before the first snapshot).
+    if (!hasBeenInRoomRef.current) return;
+
+    // We were in the room and are now gone — kicked or cleared.
+    hasBeenInRoomRef.current = false;
+    setRoomId(null);
+    setRole(null);
+    setHasRevealedRole(false);
+    setThemeAcknowledgedRound(0);
+    setSavedInvestigatedPlayerId(null);
+    setSavedVoteComplete(false);
+    setMyVote(null);
+    setRoundPhotoFile(null);
+    setScreen("menu");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, uid, players, room]);
+
+  // ── Client-side upload→elimination transition (Cloud Function fallback) ───────
+  useEffect(() => {
+    if (!roomId || !room?.currentRound) return;
+    if (room.gamePhase !== "round-upload" && room.gamePhase !== "round-action") return;
+    if (!roundData || (roundData.roundPhase !== "upload" && roundData.roundPhase !== "action")) return;
+    const submissions = roundData.submissions ?? {};
+    const subCount = Object.keys(submissions).length;
+    const playerCount = players.length;
+    // #region agent log
+    sendDebugLog("H9", "src/app/App.tsx:advance-effect", "Advance effect evaluated", {
+      subCount,
+      playerCount,
+      roomGamePhase: room.gamePhase,
+      roundPhase: roundData.roundPhase,
+      willAttempt: subCount >= playerCount && playerCount >= 4,
+    });
+    // #endregion
+    if (subCount < playerCount || playerCount < 4) return;
+    advanceRoundToElimination(roomId, room.currentRound)
+      .then(() => {
+        // #region agent log
+        sendDebugLog("H9", "src/app/App.tsx:advance-success", "advanceRoundToElimination resolved", { subCount, playerCount });
+        // #endregion
+      })
+      .catch((err: Error) => {
+        // #region agent log
+        sendDebugLog("H9", "src/app/App.tsx:advance-error", "advanceRoundToElimination rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code });
+        // #endregion
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.submissions, players.length]);
+
+  // ── Client-side elimination→eliminated-reveal transition (Cloud Function fallback) ───
+  useEffect(() => {
+    if (!roomId || !room?.currentRound || room.gamePhase !== "round-elimination") return;
+    if (!roundData || roundData.roundPhase !== "elimination") return;
+    const confirmed = roundData.marcoConfirmed ?? [];
+    const marcoCount = room.marcoCount ?? 1;
+    if (confirmed.length < marcoCount || !roundData.marcoSubmission) return;
+    // #region agent log
+    sendDebugLog("H10", "src/app/App.tsx:elim-advance-effect", "elimination→clue attempt", { confirmed: confirmed.length, marcoCount });
+    // #endregion
+    advanceRoundFromElimination(roomId, room.currentRound)
+      .then(() => { sendDebugLog("H10", "src/app/App.tsx:elim-advance-success", "advanceRoundFromElimination resolved", {}); })
+      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:elim-advance-error", "advanceRoundFromElimination rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, room?.currentRound, room?.gamePhase, room?.marcoCount, roundData?.roundPhase, roundData?.marcoConfirmed, roundData?.marcoSubmission]);
+
+  // ── Client-side clue→photo-reveal transition (Cloud Function fallback) ───────
+  useEffect(() => {
+    if (!roomId || !room?.currentRound || room.gamePhase !== "eliminated-reveal") return;
+    if (!roundData || roundData.roundPhase !== "clue") return;
+    if (!roundData.selectedClue) return;
+    // #region agent log
+    sendDebugLog("H10", "src/app/App.tsx:clue-advance-effect", "clue→reveal attempt", { clue: roundData.selectedClue });
+    // #endregion
+    advanceRoundFromClue(roomId, room.currentRound)
+      .then(() => { sendDebugLog("H10", "src/app/App.tsx:clue-advance-success", "advanceRoundFromClue resolved", {}); })
+      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:clue-advance-error", "advanceRoundFromClue rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.selectedClue]);
+
+  // ── Auto-advance to investigation once everyone votes on photo-reveal ────────
+  useEffect(() => {
+    if (!roomId || !room?.currentRound || room.gamePhase !== "photo-reveal") return;
+    if (!roundData || roundData.roundPhase !== "reveal") return;
+    if (roundData.advanceToInvestigation) return; // already triggered
+    const votes = roundData.investigationVotes ?? {};
+    const eligible = activePlayers;
+    if (eligible.length === 0 || Object.keys(votes).length < eligible.length) return;
+    advanceToInvestigation(roomId, room.currentRound).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.advanceToInvestigation, roundData?.investigationVotes, activePlayers.length]);
+
+  // ── Client-side reveal→investigation transition (Cloud Function fallback) ────
+  useEffect(() => {
+    if (!roomId || !room?.currentRound || room.gamePhase !== "photo-reveal") return;
+    if (!roundData || roundData.roundPhase !== "reveal") return;
+    if (!roundData.advanceToInvestigation) return;
+    // #region agent log
+    sendDebugLog("H10", "src/app/App.tsx:reveal-advance-effect", "reveal→vote attempt", {});
+    // #endregion
+    advanceRoundFromReveal(roomId, room.currentRound)
+      .then(() => { sendDebugLog("H10", "src/app/App.tsx:reveal-advance-success", "advanceRoundFromReveal resolved", {}); })
+      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:reveal-advance-error", "advanceRoundFromReveal rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.advanceToInvestigation]);
+
+  // ── Client-side vote→done/next-round transition (Cloud Function fallback) ────
+  useEffect(() => {
+    if (!roomId || !room?.currentRound || room.gamePhase !== "investigation") return;
+    if (!roundData || roundData.roundPhase !== "vote") return;
+    const votes = roundData.investigationVotes ?? {};
+    const eliminatedIds = room.eliminatedPlayerIds ?? [];
+    const eligibleVoters = players.filter((p) => !eliminatedIds.includes(p.id));
+    if (Object.keys(votes).length < eligibleVoters.length) return;
+
+    // Compute winner client-side immediately so every client saves the result NOW,
+    // before currentRound advances (which would switch the roundData subscription and
+    // lose the investigatedPlayerId before it can be read from Firestore).
+    const tallies: Record<string, number> = {};
+    for (const targetId of Object.values(votes)) {
+      tallies[targetId] = (tallies[targetId] ?? 0) + 1;
+    }
+    let maxVotes = 0;
+    let topTargets: string[] = [];
+    for (const [targetId, count] of Object.entries(tallies)) {
+      if (count > maxVotes) { maxVotes = count; topTargets = [targetId]; }
+      else if (count === maxVotes) { topTargets.push(targetId); }
+    }
+    // Only set a winner when there is a strict majority; ties produce no investigation result.
+    const computedWinnerId = topTargets.length === 1 ? topTargets[0] : null;
+    if (computedWinnerId) setSavedInvestigatedPlayerId(computedWinnerId);
+    setSavedVoteComplete(true);
+
+    // #region agent log
+    sendDebugLog("H10", "src/app/App.tsx:vote-advance-effect", "vote→done attempt", { votes: Object.keys(votes).length, eligible: eligibleVoters.length });
+    // #endregion
+    advanceRoundFromVote(roomId, room.currentRound, players)
+      .then(() => { sendDebugLog("H10", "src/app/App.tsx:vote-advance-success", "advanceRoundFromVote resolved", {}); })
+      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:vote-advance-error", "advanceRoundFromVote rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.investigationVotes, players]);
+
+  // ── Private reveal subscription (only when eliminated player on eliminated-reveal) ──
+  useEffect(() => {
+    if (
+      !roomId ||
+      !room?.currentRound ||
+      screen !== "eliminated-reveal" ||
+      !uid ||
+      uid !== roundData?.eliminatedPlayerId
+    ) {
+      setPrivateRevealData(null);
+      return;
+    }
+    const unsub = listenRoundPrivate(roomId, room.currentRound, (data) => {
+      if (data && data.forPlayerId === uid) setPrivateRevealData(data);
+    });
+    return () => unsub();
+  }, [roomId, room?.currentRound, screen, uid, roundData?.eliminatedPlayerId]);
 
   // ── Heartbeat ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -295,26 +473,51 @@ export default function App() {
   // ── Screen transitions driven by server state ─────────────────────────────
   useEffect(() => {
     if (!room) return;
+
+    // Room was reset (or is a fresh lobby) — snap everyone back to the lobby
+    // and clear all local game state so a new game starts clean.
+    if (room.state === "waiting") {
+      if (screen === "lobby" || screen === "menu") return;
+      setRole(null);
+      setHasRevealedRole(false);
+      setThemeAcknowledgedRound(0);
+      setSavedInvestigatedPlayerId(null);
+      setSavedVoteComplete(false);
+      setMyVote(null);
+      setRoundPhotoFile(null);
+      setRoundUploadError(null);
+      setScreen("lobby");
+      return;
+    }
+
     if (room.state === "playing") {
-      if (!room.gamePhase) {
-        if (screen === "lobby") setScreen("photo-upload");
+      // "round-action" is the legacy phase name used by older deployed Cloud Functions; treat as "round-upload"
+      if (room.gamePhase === "round-upload" || room.gamePhase === "round-action") {
+        // Don't auto-navigate away from the investigation result screen; wait for Continue
+        if (screen === "investigation") return;
+        if (!hasRevealedRole) { setScreen("role-reveal"); return; }
+        // Show theme reveal once per round before photo upload
+        if ((room.currentRound ?? 1) > themeAcknowledgedRound) {
+          if (screen !== "round-theme") setScreen("round-theme");
+          return;
+        }
+        if (screen !== "round-upload") {
+          setRoundPhotoFile(null);
+          setRoundUploadError(null);
+          setScreen("round-upload");
+        }
         return;
       }
-      if (room.gamePhase === "round-action") {
-        if (!hasRevealedRole) { setScreen("role-reveal"); return; }
-        if (screen !== "round-action") {
-          // reset per-round action state only when entering the screen
-          setMarcoTargetId(null);
-          setMarcoPrivatePhoto(null);
-          setMarcoPublicPhoto(null);
-          setRegPublicPhoto(null);
-          setScreen("round-action");
+      if (room.gamePhase === "round-elimination") {
+        if (screen !== "round-elimination") {
+          setMarcoEliminationTarget(null);
+          setScreen("round-elimination");
         }
         return;
       }
       if (room.gamePhase === "eliminated-reveal" && screen !== "eliminated-reveal") {
         setScreen("eliminated-reveal");
-        setClueInput("");
+        setSelectedClueWord(null);
         return;
       }
       if (room.gamePhase === "photo-reveal" && screen !== "photo-reveal") {
@@ -326,17 +529,32 @@ export default function App() {
         setMyVote(null);
         return;
       }
-      if (room.gamePhase === "game-over" && screen !== "game-over") {
-        setScreen("game-over");
+      if (room.gamePhase === "game-over") {
+        if (screen === "investigation") return; // Wait for Continue on investigation result screen
+        if (screen !== "game-over") setScreen("game-over");
         return;
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [room?.state, room?.gamePhase, hasRevealedRole]);
+  }, [room?.state, room?.gamePhase, hasRevealedRole, themeAcknowledgedRound]);
 
-  // ── Reset math state on each new round ───────────────────────────────────
+  // ── Persist investigation result so it survives currentRound advancing ──────
   useEffect(() => {
-    if (screen === "round-action") {
+    if (roundData?.investigatedPlayerId) {
+      setSavedInvestigatedPlayerId(roundData.investigatedPlayerId);
+    }
+  }, [roundData?.investigatedPlayerId]);
+
+  useEffect(() => {
+    // Only reset myVote on round change; savedInvestigatedPlayerId must NOT be cleared here
+    // because the investigation screen stays visible while currentRound has already advanced,
+    // and clearing it immediately would wipe the result the user needs to see.
+    setMyVote(null);
+  }, [room?.currentRound]);
+
+  // ── Reset math + per-round state on each new round ────────────────────────
+  useEffect(() => {
+    if (screen === "round-upload" || screen === "round-elimination" || screen === "round-theme") {
       setMathQ(createMathQuestion());
       setMathScore(0);
       setMathInput("");
@@ -378,8 +596,6 @@ export default function App() {
     try {
       const result = await joinMainRoom(savedName);
       setRoomId(result.roomId);
-      // Default to lobby; the game-phase transition effect will move the screen
-      // forward if the game is already in progress (rejoin case).
       setScreen("lobby");
     } catch (err) { setError((err as Error).message); }
     finally { setIsBusy(false); }
@@ -399,9 +615,15 @@ export default function App() {
     setError(null); setIsBusy(true);
     try {
       await leaveRoom(roomId);
+      hasBeenInRoomRef.current = false;
       setRole(null);
       setHasRevealedRole(false);
       setRoundData(null);
+      setThemeAcknowledgedRound(0);
+      setSavedInvestigatedPlayerId(null);
+      setSavedVoteComplete(false);
+      setMyVote(null);
+      setRoundPhotoFile(null);
       setRoomId(null);
       setScreen("menu");
     } catch (err) { setError((err as Error).message); }
@@ -411,94 +633,56 @@ export default function App() {
   const handleRevealRole = () => {
     if (!currentPlayer?.role) return;
     setRole(currentPlayer.role as Role);
-    // hasRevealedRole is set by the "Continue" button so the player can see their role first
   };
 
-  // ── Photo upload ──────────────────────────────────────────────────────────
-  const handleSelectUploadFiles = () => {
-    setUploadError(null);
-    fileInputRef.current?.click();
-  };
-
-  const handleUploadFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    if (files.length !== photosPerPlayer) {
-      setUploadError(`Select exactly ${photosPerPlayer} photos. You picked ${files.length}.`);
-      e.target.value = "";
-      return;
-    }
-    setUploadError(null);
-    setIsUploading(true);
+  // ── Per-round photo upload ─────────────────────────────────────────────────
+  const handleRoundPhotoChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setRoundUploadError(null);
+    setIsRoundUploading(true);
     try {
-      const converted = await Promise.all(Array.from(files).map(ensureJpeg));
-      setUploadFiles(converted);
+      const converted = await ensureJpeg(file);
+      setRoundPhotoFile(converted);
     } catch (err) {
-      setUploadError("Failed to process one or more photos. Please try again.");
-      console.error(err);
+      setRoundUploadError((err as Error).message);
     } finally {
-      setIsUploading(false);
+      setIsRoundUploading(false);
+      e.target.value = "";
     }
   };
 
-  const handleUploadPhotos = async () => {
-    if (!roomId || !uploadFiles) return;
-    setIsUploading(true);
-    setUploadError(null);
-    try { await uploadPhotoPool(roomId, uploadFiles); }
-    catch (err) { setUploadError((err as Error).message); }
-    finally { setIsUploading(false); }
+  const handleUploadRoundPhoto = async () => {
+    if (!roomId || !room?.currentRound || !roundPhotoFile) return;
+    setIsRoundUploading(true);
+    setRoundUploadError(null);
+    try { await submitRoundPhoto(roomId, room.currentRound, roundPhotoFile); }
+    catch (err) { setRoundUploadError((err as Error).message); }
+    finally { setIsRoundUploading(false); }
   };
 
-  // ── Marco action ──────────────────────────────────────────────────────────
-  const marcoEligibleTargets = activePlayers.filter(
-    (p) => p.role !== "Marco" && p.id !== uid,
-  );
-
-  const existingProposal = useMemo(() => {
-    if (!roundData?.marcoSubmissions) return null;
-    const entries = Object.entries(roundData.marcoSubmissions);
-    return entries.length > 0 ? entries[0] : null;
-  }, [roundData?.marcoSubmissions]);
-
-  const hasSubmitted = uid
-    ? Boolean(roundData?.marcoSubmissions?.[uid])
-    : false;
-  const hasConfirmed = uid
-    ? (roundData?.marcoConfirmed ?? []).includes(uid)
-    : false;
-
-  const handleSubmitMarcoAction = async () => {
-    if (!roomId || !room?.currentRound || !marcoTargetId || !marcoPrivatePhoto || !marcoPublicPhoto) return;
+  // ── Marco elimination ─────────────────────────────────────────────────────
+  const handleSubmitMarcoElimination = async () => {
+    if (!roomId || !room?.currentRound || !marcoEliminationTarget) return;
     setError(null); setIsBusy(true);
-    try {
-      await submitMarcoAction(roomId, room.currentRound, marcoTargetId, marcoPrivatePhoto, marcoPublicPhoto);
-    } catch (err) { setError((err as Error).message); }
+    try { await submitMarcoElimination(roomId, room.currentRound, marcoEliminationTarget); }
+    catch (err) { setError((err as Error).message); }
     finally { setIsBusy(false); }
   };
 
-  const handleConfirmMarcoAction = async () => {
+  const handleConfirmMarcoElimination = async () => {
     if (!roomId || !room?.currentRound) return;
     setError(null); setIsBusy(true);
-    try { await confirmMarcoAction(roomId, room.currentRound); }
+    try { await confirmMarcoElimination(roomId, room.currentRound); }
     catch (err) { setError((err as Error).message); }
     finally { setIsBusy(false); }
   };
 
-  // ── Reg action ────────────────────────────────────────────────────────────
-  const handleSubmitRegPhoto = async () => {
-    if (!roomId || !room?.currentRound || !regPublicPhoto) return;
+  // ── Eliminated clue word ──────────────────────────────────────────────────
+  const handleSubmitClueWord = async () => {
+    if (!roomId || !room?.currentRound || !selectedClueWord) return;
     setError(null); setIsBusy(true);
-    try { await submitRegPhoto(roomId, room.currentRound, regPublicPhoto); }
-    catch (err) { setError((err as Error).message); }
-    finally { setIsBusy(false); }
-  };
-
-  // ── Eliminated clue ───────────────────────────────────────────────────────
-  const handleSubmitClue = async () => {
-    if (!roomId || !room?.currentRound || !clueInput.trim()) return;
-    setError(null); setIsBusy(true);
-    try { await submitEliminatedClue(roomId, room.currentRound, clueInput.trim()); }
+    try { await submitClueWord(roomId, room.currentRound, selectedClueWord); }
     catch (err) { setError((err as Error).message); }
     finally { setIsBusy(false); }
   };
@@ -512,7 +696,32 @@ export default function App() {
     finally { setIsBusy(false); }
   };
 
-  // ── Investigation vote ────────────────────────────────────────────────────
+  // ── Investigation result: continue to next round or game-over ───────────────
+  const handleContinueFromInvestigation = async () => {
+    setSavedInvestigatedPlayerId(null);
+    setSavedVoteComplete(false);
+    const phase = room?.gamePhase;
+    if (phase === "game-over") { setScreen("game-over"); return; }
+    if (phase === "round-action" || phase === "round-upload") {
+      // Old CF or client already advanced; navigate to the new round
+      if (!hasRevealedRole) { setScreen("role-reveal"); return; }
+      setScreen("round-theme");
+      return;
+    }
+    // Still in investigation — advance client-side (no CF running)
+    if (roomId && room?.currentRound) {
+      setIsBusy(true); setError(null);
+      try {
+        await advanceRoundFromVote(roomId, room.currentRound, players);
+        // advanceRoundFromVote sets round-upload or game-over; screen nav is guarded,
+        // so navigate manually based on the new state
+        setScreen("round-theme");
+      } catch (err) { setError((err as Error).message); }
+      finally { setIsBusy(false); }
+    }
+  };
+
+  // ── Investigation vote (also used on photo-reveal for pre-voting) ─────────
   const handleVote = async (targetUid: string) => {
     if (!roomId || !room?.currentRound || myVote) return;
     setMyVote(targetUid);
@@ -543,10 +752,156 @@ export default function App() {
 
   // ── Derived display helpers ───────────────────────────────────────────────
   const playerName = (id: string) => players.find((p) => p.id === id)?.name ?? id;
-  const uploadedCount = players.filter((p) => p.hasUploadedPhotos).length;
   const eliminatedPlayer = roundData?.eliminatedPlayerId
     ? players.find((p) => p.id === roundData.eliminatedPlayerId)
     : null;
+  const submissionsGrid = Object.entries(roundData?.submissions ?? {});
+
+  const sendDebugLog = (
+    hypothesisId: string,
+    location: string,
+    message: string,
+    data: Record<string, unknown>,
+  ) => {
+    // #region agent log
+    fetch("http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Debug-Session-Id": "d485e8",
+      },
+      body: JSON.stringify({
+        sessionId: "d485e8",
+        runId: "repro1",
+        hypothesisId,
+        location,
+        message,
+        data,
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+  };
+
+  useEffect(() => {
+    if (!room) return;
+    const sig = JSON.stringify({
+      state: room.state ?? null,
+      gamePhase: room.gamePhase ?? null,
+      currentRound: room.currentRound ?? null,
+      playerCount: room.playerCount ?? null,
+      marcoCount: room.marcoCount ?? null,
+      eliminatedCount: (room.eliminatedPlayerIds ?? []).length,
+    });
+    if (debugLastRoomSigRef.current === sig) return;
+    debugLastRoomSigRef.current = sig;
+    // #region agent log
+    sendDebugLog("H2", "src/app/App.tsx:room-snapshot", "Room snapshot changed", {
+      roomState: room.state ?? null,
+      gamePhase: room.gamePhase ?? null,
+      currentRound: room.currentRound ?? null,
+      playerCount: room.playerCount ?? null,
+      marcoCount: room.marcoCount ?? null,
+      eliminatedPlayerIds: room.eliminatedPlayerIds ?? [],
+    });
+    // #endregion
+  }, [room]);
+
+  useEffect(() => {
+    if (!roundData) return;
+    const submissions = roundData.submissions ?? {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dbg = (roundData as any)._dbgFunctionRan ?? null;
+    const sig = JSON.stringify({
+      roundPhase: roundData.roundPhase ?? null,
+      uploadCount: Object.keys(submissions).length,
+      submissionIds: Object.keys(submissions).sort(),
+      marcoSubmissionBy: roundData.marcoSubmission?.marcoPlayerId ?? null,
+      marcoTarget: roundData.marcoSubmission?.eliminatedPlayerId ?? null,
+      marcoConfirmedCount: (roundData.marcoConfirmed ?? []).length,
+      selectedClue: roundData.selectedClue ?? null,
+      dbgFunctionRanUploadCount: dbg?.uploadCount ?? null,
+    });
+    if (debugLastRoundSigRef.current === sig) return;
+    debugLastRoundSigRef.current = sig;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dbg2 = (roundData as any)._dbgFunctionRan ?? null;
+    // #region agent log
+    sendDebugLog("H1", "src/app/App.tsx:round-snapshot", "Round snapshot changed", {
+      roundPhase: roundData.roundPhase ?? null,
+      uploadCount: Object.keys(submissions).length,
+      submissionIds: Object.keys(submissions),
+      marcoSubmission: roundData.marcoSubmission ?? null,
+      marcoConfirmed: roundData.marcoConfirmed ?? [],
+      selectedClue: roundData.selectedClue ?? null,
+      advanceToInvestigation: roundData.advanceToInvestigation ?? false,
+      dbgFunctionRan: dbg2 ? { uploadCount: dbg2.uploadCount, totalPlayers: dbg2.totalPlayers, roundPhase: dbg2.roundPhase } : null,
+    });
+    // #endregion
+  }, [roundData]);
+
+  useEffect(() => {
+    const sig = JSON.stringify({
+      screen,
+      roomState: room?.state ?? null,
+      roomPhase: room?.gamePhase ?? null,
+      hasRevealedRole,
+      themeAcknowledgedRound,
+      currentRound: room?.currentRound ?? null,
+    });
+    if (debugLastScreenSigRef.current === sig) return;
+    debugLastScreenSigRef.current = sig;
+    // #region agent log
+    sendDebugLog("H3", "src/app/App.tsx:screen-transition", "Screen/state snapshot", {
+      screen,
+      roomState: room?.state ?? null,
+      roomGamePhase: room?.gamePhase ?? null,
+      hasRevealedRole,
+      themeAcknowledgedRound,
+      currentRound: room?.currentRound ?? null,
+    });
+    // #endregion
+  }, [screen, room?.state, room?.gamePhase, room?.currentRound, hasRevealedRole, themeAcknowledgedRound]);
+
+  useEffect(() => {
+    const playersInRoom = players.map((p) => p.id);
+    const membership = uid ? playersInRoom.includes(uid) : false;
+    const sig = JSON.stringify({
+      uid: uid ?? null,
+      membership,
+      playersCount: players.length,
+      roomPlayerCount: room?.playerCount ?? null,
+      roleState: role ?? null,
+      playerRole: currentPlayer?.role ?? null,
+      effectiveRole: effectiveRole ?? null,
+      isEliminated,
+      roomPhase: room?.gamePhase ?? null,
+    });
+    if (debugLastMembershipSigRef.current === sig) return;
+    debugLastMembershipSigRef.current = sig;
+    // #region agent log
+    sendDebugLog("H4", "src/app/App.tsx:membership-role", "Membership and role snapshot", {
+      uid: uid ?? null,
+      isInPlayersList: membership,
+      playersCount: players.length,
+      roomPlayerCount: room?.playerCount ?? null,
+      localRoleState: role ?? null,
+      serverPlayerRole: currentPlayer?.role ?? null,
+      effectiveRole: effectiveRole ?? null,
+      isEliminated,
+      roomGamePhase: room?.gamePhase ?? null,
+    });
+    // #endregion
+  }, [
+    uid,
+    players,
+    room?.playerCount,
+    role,
+    currentPlayer?.role,
+    effectiveRole,
+    isEliminated,
+    room?.gamePhase,
+  ]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -576,9 +931,7 @@ export default function App() {
               {!isNameValid && nameInput.length > 0 && (
                 <p className="text-sm text-red-500">Name must contain at least one letter or number.</p>
               )}
-              {!authReady && (
-                <p className="text-sm text-red-500">Waiting for sign-in...</p>
-              )}
+              {!authReady && <p className="text-sm text-red-500">Waiting for sign-in...</p>}
             </div>
             {error && <p className="text-sm text-red-500">{error}</p>}
           </div>
@@ -629,67 +982,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ── PHOTO UPLOAD ─────────────────────────────────────────────── */}
-        {screen === "photo-upload" && (
-          <div className="space-y-6 sm:space-y-8">
-            <h1 className="text-3xl sm:text-4xl lg:text-5xl">Upload Your Photos</h1>
-            {currentPlayer?.hasUploadedPhotos ? (
-              <>
-                <div className="bg-green-50 border-2 border-green-400 rounded-3xl p-6">
-                  <p className="text-xl text-green-700 font-semibold">Photos uploaded!</p>
-                  <p className="text-gray-600 mt-1">
-                    {uploadedCount}/{players.length} players ready
-                  </p>
-                </div>
-                <p className="text-gray-500">Waiting for others to upload their photos…</p>
-              </>
-            ) : (
-              <>
-                <p className="text-base sm:text-lg">
-                  Select exactly <strong>{photosPerPlayer} photos</strong> from your camera roll.
-                  These will be your photo pool for the entire game.
-                </p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  className="hidden"
-                  onChange={handleUploadFileChange}
-                />
-                {uploadFiles ? (
-                  <div className="bg-blue-50 border-2 border-blue-200 rounded-3xl p-6">
-                    <p className="text-blue-700 font-semibold">{uploadFiles.length} photos selected</p>
-                    <div className="grid grid-cols-4 sm:grid-cols-6 gap-2 mt-4">
-                      {uploadFiles.map((f, i) => (
-                        <img
-                          key={i}
-                          src={URL.createObjectURL(f)}
-                          alt={`Photo ${i + 1}`}
-                          className="w-full aspect-square object-cover rounded-lg"
-                        />
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {uploadError && <p className="text-sm text-red-500">{uploadError}</p>}
-                <div className="flex flex-col gap-3 items-center">
-                  <BubbleButton onClick={handleSelectUploadFiles} disabled={isUploading}>
-                    {uploadFiles ? "Change Photos" : "Select Photos"}
-                  </BubbleButton>
-                  {uploadFiles && (
-                    <BubbleButton onClick={handleUploadPhotos} disabled={isUploading}>
-                      {isUploading ? "Uploading…" : "Upload Photos"}
-                    </BubbleButton>
-                  )}
-                </div>
-              </>
-            )}
-            <p className="text-sm text-gray-500">{uploadedCount}/{players.length} players uploaded</p>
-            <BubbleButton onClick={handleLeaveRoom} disabled={isBusy || isUploading}>Leave Room</BubbleButton>
-          </div>
-        )}
-
         {/* ── ROLE REVEAL ──────────────────────────────────────────────── */}
         {screen === "role-reveal" && (
           <div className="space-y-6 sm:space-y-8">
@@ -730,15 +1022,194 @@ export default function App() {
           </div>
         )}
 
-        {/* ── ROUND ACTION ─────────────────────────────────────────────── */}
-        {screen === "round-action" && (
+        {/* ── ROUND THEME ──────────────────────────────────────────────── */}
+        {screen === "round-theme" && (
           <div className="space-y-6 sm:space-y-8">
+            <RoundProgressBar currentRound={room?.currentRound ?? 1} totalRounds={room?.rounds ?? 1} />
+            <h1 className="text-3xl sm:text-4xl lg:text-5xl">Theme Reveal</h1>
+            {roundData ? (
+              <>
+                <div className="bg-blue-500 text-white rounded-3xl p-8 sm:p-12 shadow-2xl">
+                  <p className="text-sm uppercase tracking-widest mb-2 opacity-80">This round's theme</p>
+                  <p className="text-4xl sm:text-6xl font-bold">{roundData.theme}</p>
+                </div>
+                <p className="text-base sm:text-lg text-gray-600">
+                  Take a photo that fits this theme — you'll upload it next.
+                </p>
+                <BubbleButton onClick={() => setThemeAcknowledgedRound(room?.currentRound ?? 0)}>
+                  Let's Go!
+                </BubbleButton>
+              </>
+            ) : (
+              <p className="text-gray-500">Loading theme…</p>
+            )}
+            <BubbleButton onClick={handleLeaveRoom} disabled={isBusy}>Leave Room</BubbleButton>
+          </div>
+        )}
+
+        {/* ── ROUND UPLOAD ─────────────────────────────────────────────── */}
+        {screen === "round-upload" && (
+          <div className="space-y-6 sm:space-y-8">
+            <RoundProgressBar currentRound={room?.currentRound ?? 1} totalRounds={room?.rounds ?? 1} />
+            <h1 className="text-2xl sm:text-3xl lg:text-4xl">Upload Your Photo</h1>
+            {roundData && (
+              <div className="bg-blue-50 border-2 border-blue-200 rounded-2xl px-4 py-3 inline-block">
+                <p className="text-sm text-blue-500 uppercase tracking-wide">Theme</p>
+                <p className="text-2xl font-bold text-blue-700">{roundData.theme}</p>
+              </div>
+            )}
+
+            {uid && roundData?.submissions?.[uid] ? (
+              // Already uploaded — show preview and wait
+              <div className="space-y-4">
+                <div className="bg-green-50 border-2 border-green-400 rounded-3xl p-6">
+                  <p className="text-xl text-green-700 font-semibold">Photo submitted!</p>
+                  <p className="text-gray-600 mt-1">
+                    {Object.keys(roundData.submissions).length}/{players.length} players submitted
+                  </p>
+                </div>
+                <img
+                  src={roundData.submissions[uid]}
+                  alt="Your round photo"
+                  className="mx-auto max-w-xs rounded-3xl shadow-lg"
+                />
+                <p className="text-gray-500">Waiting for everyone else to upload…</p>
+              </div>
+            ) : (
+              // Not yet uploaded
+              <div className="space-y-4">
+                <p className="text-base sm:text-lg">
+                  Select one photo from your camera roll that fits the theme.
+                </p>
+                <input
+                  ref={roundPhotoInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={handleRoundPhotoChange}
+                />
+                {roundPhotoFile && (
+                  <img
+                    src={URL.createObjectURL(roundPhotoFile)}
+                    alt="Preview"
+                    className="mx-auto max-w-xs rounded-3xl shadow"
+                  />
+                )}
+                {roundUploadError && <p className="text-sm text-red-500">{roundUploadError}</p>}
+                <div className="flex flex-col items-center gap-3">
+                  <BubbleButton
+                    onClick={() => roundPhotoInputRef.current?.click()}
+                    disabled={isRoundUploading}
+                  >
+                    {roundPhotoFile ? "Change Photo" : "Select Photo"}
+                  </BubbleButton>
+                  {roundPhotoFile && (
+                    <BubbleButton onClick={handleUploadRoundPhoto} disabled={isRoundUploading}>
+                      {isRoundUploading ? "Uploading…" : "Upload Photo"}
+                    </BubbleButton>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {error && <p className="text-sm text-red-500">{error}</p>}
+            <BubbleButton onClick={handleLeaveRoom} disabled={isBusy || isRoundUploading}>Leave Room</BubbleButton>
+          </div>
+        )}
+
+        {/* ── ROUND ELIMINATION ────────────────────────────────────────── */}
+        {screen === "round-elimination" && (
+          <div className="space-y-6 sm:space-y-8">
+            <RoundProgressBar currentRound={room?.currentRound ?? 1} totalRounds={room?.rounds ?? 1} />
             <h1 className="text-2xl sm:text-3xl lg:text-4xl">
-              Round {room?.currentRound ?? "?"} of {room?.rounds ?? "?"}
+              {effectiveRole === "Marco" && !isEliminated ? "Pick Your Target" : "Waiting…"}
             </h1>
 
-            {/* Eliminated player: math questions to stay occupied */}
-            {isEliminated && (
+            {/* Marco: see full grid + pick target */}
+            {effectiveRole === "Marco" && !isEliminated && (
+              <div className="space-y-6">
+                {/* Submissions grid for Marco's reference */}
+                <div className="space-y-2">
+                  <p className="text-sm text-gray-500 uppercase tracking-wide">All submitted photos</p>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {submissionsGrid.map(([playerId, url]) => (
+                      <div key={playerId} className="space-y-1">
+                        <img
+                          src={url}
+                          alt={playerName(playerId)}
+                          className="w-full aspect-square object-cover rounded-2xl shadow"
+                        />
+                        <p className="text-xs text-center text-gray-600 truncate font-medium">
+                          {playerName(playerId)}{playerId === uid ? " (you)" : ""}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Existing proposal from another Marco */}
+                {existingProposal && !hasSubmitted && (
+                  <div className="bg-blue-50 border-2 border-blue-200 rounded-3xl p-6 text-left">
+                    <p className="font-semibold text-blue-700 mb-2">
+                      {playerName(existingProposal.marcoPlayerId)} proposes eliminating:{" "}
+                      <strong>{playerName(existingProposal.eliminatedPlayerId)}</strong>
+                    </p>
+                    {!hasConfirmed ? (
+                      <BubbleButton onClick={handleConfirmMarcoElimination} disabled={isBusy} className="mt-2">
+                        Confirm This Plan
+                      </BubbleButton>
+                    ) : (
+                      <p className="text-green-600 font-semibold mt-2">
+                        You confirmed. Waiting for other Marcos…
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Own submission status */}
+                {hasSubmitted && (
+                  <div className="bg-green-50 border-2 border-green-400 rounded-3xl p-6">
+                    <p className="text-green-700 font-semibold">
+                      Your plan submitted: eliminate <strong>{playerName(roundData?.marcoSubmission?.eliminatedPlayerId ?? "")}</strong>
+                    </p>
+                    <p className="text-gray-500 text-sm mt-1">
+                      {(roundData?.marcoConfirmed ?? []).length}/{room?.marcoCount ?? 1} Marcos confirmed.
+                    </p>
+                  </div>
+                )}
+
+                {/* Target picker (always visible for Marco to override) */}
+                <div className="space-y-3 text-left">
+                  <p className="font-semibold">
+                    {hasSubmitted ? "Override target:" : "Who to eliminate:"}
+                  </p>
+                  <div className="space-y-1">
+                    {marcoEligibleTargets.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => setMarcoEliminationTarget(p.id)}
+                        className={`w-full px-4 py-3 rounded-full text-left border-2 transition-all ${
+                          marcoEliminationTarget === p.id
+                            ? "border-blue-500 bg-blue-50"
+                            : "border-gray-200 hover:border-blue-300"
+                        }`}
+                      >
+                        {p.name}
+                      </button>
+                    ))}
+                  </div>
+                  {marcoEliminationTarget && (
+                    <BubbleButton onClick={handleSubmitMarcoElimination} disabled={isBusy}>
+                      {hasSubmitted ? "Update Plan" : "Submit Plan"}
+                    </BubbleButton>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Regs and previously-eliminated players: busywork math */}
+            {(effectiveRole === "Reg" || isEliminated) && (
               <MathSection
                 mathQ={mathQ}
                 mathInput={mathInput}
@@ -756,162 +1227,8 @@ export default function App() {
                     }, 600);
                   }
                 }}
-                subtitle="You've been eliminated — keep busy while the round is set up."
+                subtitle="Stay busy while the Marcos decide…"
               />
-            )}
-
-            {/* Reg action: photo picker first, then math while waiting for Marcos */}
-            {!isEliminated && role === "Reg" && (
-              <div className="space-y-4">
-                {uid && roundData?.publicPhotoUrls?.[uid] ? (
-                  // Photo submitted — do math until Marcos confirm and round advances
-                  <MathSection
-                    mathQ={mathQ}
-                    mathInput={mathInput}
-                    mathScore={mathScore}
-                    mathFeedback={mathFeedback}
-                    onInput={(val) => {
-                      setMathInput(val);
-                      if (parseInt(val, 10) === mathQ.answer) {
-                        setMathScore((s) => s + 1);
-                        setMathFeedback("correct");
-                        setTimeout(() => {
-                          setMathFeedback(null);
-                          setMathQ(createMathQuestion());
-                          setMathInput("");
-                        }, 600);
-                      }
-                    }}
-                    subtitle="Photo submitted! Keep busy while the Marcos decide…"
-                  />
-                ) : (
-                  // Haven't submitted yet — pick a photo first
-                  <>
-                    <p className="text-base sm:text-lg">Pick one photo to share this round:</p>
-                    <div className="grid grid-cols-3 sm:grid-cols-4 gap-3">
-                      {availablePhotos.map((url) => (
-                        <button
-                          key={url}
-                          type="button"
-                          onClick={() => setRegPublicPhoto(url)}
-                          className={`aspect-square rounded-2xl overflow-hidden border-4 transition-all ${
-                            regPublicPhoto === url ? "border-blue-500 scale-105" : "border-transparent"
-                          }`}
-                        >
-                          <img src={url} alt="Pool photo" className="w-full h-full object-cover" />
-                        </button>
-                      ))}
-                    </div>
-                    {regPublicPhoto && (
-                      <BubbleButton onClick={handleSubmitRegPhoto} disabled={isBusy}>
-                        Submit Photo
-                      </BubbleButton>
-                    )}
-                  </>
-                )}
-              </div>
-            )}
-
-            {/* Marco action */}
-            {!isEliminated && role === "Marco" && (
-              <div className="space-y-6">
-                {/* Show existing proposal from another Marco */}
-                {existingProposal && !hasSubmitted && (
-                  <div className="bg-blue-50 border-2 border-blue-200 rounded-3xl p-6 text-left">
-                    <p className="font-semibold text-blue-700 mb-2">
-                      Marco proposal from {playerName(existingProposal[0])}:
-                    </p>
-                    <p>Eliminate: <strong>{playerName(existingProposal[1].eliminatedPlayerId)}</strong></p>
-                    <div className="flex gap-3 mt-3">
-                      <div className="text-center">
-                        <p className="text-xs text-gray-500 mb-1">Private photo</p>
-                        <img src={existingProposal[1].privatePhotoUrl} alt="Private" className="w-20 h-20 object-cover rounded-xl" />
-                      </div>
-                      <div className="text-center">
-                        <p className="text-xs text-gray-500 mb-1">Public photo</p>
-                        <img src={existingProposal[1].publicPhotoUrl} alt="Public" className="w-20 h-20 object-cover rounded-xl" />
-                      </div>
-                    </div>
-                    {!hasConfirmed && (
-                      <BubbleButton onClick={handleConfirmMarcoAction} disabled={isBusy} className="mt-4">
-                        Confirm This Plan
-                      </BubbleButton>
-                    )}
-                    {hasConfirmed && <p className="text-green-600 mt-3 font-semibold">You confirmed. Waiting for other Marcos…</p>}
-                  </div>
-                )}
-
-                {/* Own submission status */}
-                {hasSubmitted && (
-                  <div className="bg-green-50 border-2 border-green-400 rounded-3xl p-6">
-                    <p className="text-green-700 font-semibold">
-                      Your plan is submitted ({(roundData?.marcoConfirmed ?? []).length}/{room?.marcoCount ?? 1} Marcos confirmed).
-                    </p>
-                    <p className="text-gray-500 text-sm mt-1">Other Marcos need to confirm to proceed.</p>
-                  </div>
-                )}
-
-                {/* Submission form (always visible so Marco can override) */}
-                {(!hasSubmitted || existingProposal?.[0] !== uid) && (
-                  <div className="space-y-4 text-left">
-                    <p className="font-semibold text-lg">
-                      {hasSubmitted ? "Override your plan:" : "Submit your plan:"}
-                    </p>
-
-                    <div>
-                      <p className="text-sm text-gray-600 mb-2">1. Pick who to eliminate:</p>
-                      <div className="space-y-1">
-                        {marcoEligibleTargets.map((p) => (
-                          <button
-                            key={p.id}
-                            type="button"
-                            onClick={() => setMarcoTargetId(p.id)}
-                            className={`w-full px-4 py-2 rounded-full text-left border-2 transition-all ${
-                              marcoTargetId === p.id ? "border-blue-500 bg-blue-50" : "border-gray-200"
-                            }`}
-                          >
-                            {p.name}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div>
-                      <p className="text-sm text-gray-600 mb-2">2. Pick private photo (sent only to eliminated player):</p>
-                      <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-                        {availablePhotos.filter((u) => u !== marcoPublicPhoto).map((url) => (
-                          <button key={url} type="button" onClick={() => setMarcoPrivatePhoto(url)}
-                            className={`aspect-square rounded-xl overflow-hidden border-4 transition-all ${
-                              marcoPrivatePhoto === url ? "border-blue-500 scale-105" : "border-transparent"
-                            }`}>
-                            <img src={url} alt="" className="w-full h-full object-cover" />
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div>
-                      <p className="text-sm text-gray-600 mb-2">3. Pick public photo (shown to everyone):</p>
-                      <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-                        {availablePhotos.filter((u) => u !== marcoPrivatePhoto).map((url) => (
-                          <button key={url} type="button" onClick={() => setMarcoPublicPhoto(url)}
-                            className={`aspect-square rounded-xl overflow-hidden border-4 transition-all ${
-                              marcoPublicPhoto === url ? "border-green-500 scale-105" : "border-transparent"
-                            }`}>
-                            <img src={url} alt="" className="w-full h-full object-cover" />
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {marcoTargetId && marcoPrivatePhoto && marcoPublicPhoto && (
-                      <BubbleButton onClick={handleSubmitMarcoAction} disabled={isBusy}>
-                        {hasSubmitted ? "Update Plan" : "Submit Plan"}
-                      </BubbleButton>
-                    )}
-                  </div>
-                )}
-              </div>
             )}
 
             {error && <p className="text-sm text-red-500">{error}</p>}
@@ -922,6 +1239,7 @@ export default function App() {
         {/* ── ELIMINATED REVEAL ────────────────────────────────────────── */}
         {screen === "eliminated-reveal" && (
           <div className="space-y-6 sm:space-y-8">
+            <RoundProgressBar currentRound={room?.currentRound ?? 1} totalRounds={room?.rounds ?? 1} />
             <h1 className="text-2xl sm:text-3xl lg:text-4xl">Player Eliminated</h1>
             <div className="bg-red-50 border-2 border-red-300 rounded-3xl p-6">
               <p className="text-xl font-semibold text-red-700">
@@ -929,56 +1247,72 @@ export default function App() {
               </p>
             </div>
 
-            {/* Eliminated player: sees private photo and gives clue */}
+            {/* Eliminated player: sees Marco photo and picks a clue word */}
             {uid === roundData?.eliminatedPlayerId && (
-              <div className="space-y-4">
-                <p className="text-base sm:text-lg font-semibold">Marco sent you this photo:</p>
-                {roundData.privatePhotoUrl && (
+              <div className="space-y-5">
+                <p className="text-base sm:text-lg font-semibold">
+                  This is the Marco's photo — only you can see it:
+                </p>
+                {privateRevealData ? (
                   <img
-                    src={roundData.privatePhotoUrl}
-                    alt="Private photo from Marco"
-                    className="mx-auto max-w-xs rounded-3xl shadow-lg"
+                    src={privateRevealData.marcoPhotoUrl}
+                    alt="Marco's photo (private)"
+                    className="mx-auto max-w-xs rounded-3xl shadow-lg border-4 border-blue-400"
                   />
+                ) : (
+                  <p className="text-gray-400">Loading private photo…</p>
                 )}
-                {roundData.eliminatedClue ? (
+
+                {roundData?.selectedClue ? (
                   <div className="bg-green-50 border-2 border-green-400 rounded-3xl p-6">
-                    <p className="text-green-700">Clue submitted: <strong>{roundData.eliminatedClue}</strong></p>
+                    <p className="text-green-700">
+                      Clue submitted: <strong className="text-2xl">{roundData.selectedClue}</strong>
+                    </p>
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    <p className="text-gray-600">Give the group one word to describe this photo:</p>
-                    <input
-                      type="text"
-                      value={clueInput}
-                      onChange={(e) => {
-                        const val = e.target.value.replace(/\s/g, "");
-                        setClueInput(val);
-                      }}
-                      placeholder="One word…"
-                      maxLength={30}
-                      className="border-2 border-gray-300 p-2 w-full max-w-xs text-center rounded-full"
-                    />
-                    <BubbleButton onClick={handleSubmitClue} disabled={isBusy || !clueInput.trim()}>
-                      Submit Clue
-                    </BubbleButton>
+                  <div className="space-y-4">
+                    <p className="text-gray-600">
+                      Pick one word to describe the Marco's photo to the group:
+                    </p>
+                    <div className="flex flex-wrap gap-2 justify-center">
+                      {(roundData?.clueOptions ?? []).map((word) => (
+                        <button
+                          key={word}
+                          type="button"
+                          onClick={() => setSelectedClueWord(word)}
+                          className={`px-4 py-2 rounded-full border-2 text-base font-medium transition-all ${
+                            selectedClueWord === word
+                              ? "border-blue-500 bg-blue-500 text-white scale-105"
+                              : "border-gray-300 bg-white text-gray-700 hover:border-blue-300"
+                          }`}
+                        >
+                          {word}
+                        </button>
+                      ))}
+                    </div>
+                    {selectedClueWord && (
+                      <BubbleButton onClick={handleSubmitClueWord} disabled={isBusy}>
+                        Submit Clue: "{selectedClueWord}"
+                      </BubbleButton>
+                    )}
                   </div>
                 )}
               </div>
             )}
 
-            {/* Everyone else: waiting for clue */}
+            {/* Everyone else: waiting for the clue */}
             {uid !== roundData?.eliminatedPlayerId && (
               <div className="space-y-3">
-                {roundData?.eliminatedClue ? (
+                {roundData?.selectedClue ? (
                   <div className="bg-yellow-50 border-2 border-yellow-300 rounded-3xl p-6">
                     <p className="text-gray-700">
                       {eliminatedPlayer?.name ?? "They"}'s clue:{" "}
-                      <strong className="text-2xl">{roundData.eliminatedClue}</strong>
+                      <strong className="text-2xl">{roundData.selectedClue}</strong>
                     </p>
                   </div>
                 ) : (
                   <p className="text-gray-500">
-                    Waiting for {eliminatedPlayer?.name ?? "the eliminated player"} to give their clue…
+                    Waiting for {eliminatedPlayer?.name ?? "the eliminated player"} to choose their clue…
                   </p>
                 )}
               </div>
@@ -992,60 +1326,54 @@ export default function App() {
         {/* ── PHOTO REVEAL ─────────────────────────────────────────────── */}
         {screen === "photo-reveal" && (
           <div className="space-y-6 sm:space-y-8">
+            <RoundProgressBar currentRound={room?.currentRound ?? 1} totalRounds={room?.rounds ?? 1} />
             <h1 className="text-2xl sm:text-3xl lg:text-4xl">Photos This Round</h1>
-            {roundData?.eliminatedClue && (
-              <div className="bg-yellow-50 border-2 border-yellow-300 rounded-3xl p-4">
-                <p className="text-gray-700">
-                  {eliminatedPlayer?.name}'s clue: <strong className="text-2xl">{roundData.eliminatedClue}</strong>
+
+            {/* Clue banner */}
+            {roundData?.selectedClue && (
+              <div className="bg-yellow-50 border-2 border-yellow-300 rounded-3xl p-5">
+                <p className="text-sm text-gray-500 uppercase tracking-wide mb-1">
+                  {eliminatedPlayer?.name}'s clue
                 </p>
+                <p className="text-4xl sm:text-5xl font-bold text-gray-800">{roundData.selectedClue}</p>
               </div>
             )}
+
+            {/* Full submissions grid */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-              {Object.entries(roundData?.publicPhotoUrls ?? {}).map(([playerId, url]) => (
+              {submissionsGrid.map(([playerId, url]) => (
                 <div key={playerId} className="space-y-1">
                   <img
                     src={url}
                     alt={playerName(playerId)}
                     className="w-full aspect-square object-cover rounded-2xl shadow"
                   />
-                  <p className="text-sm text-gray-600 truncate">{playerName(playerId)}</p>
+                  <p className="text-sm text-center text-gray-600 truncate font-medium">
+                    {playerName(playerId)}
+                  </p>
                 </div>
               ))}
             </div>
-            {!isEliminated && (
-              <BubbleButton onClick={handleAdvanceToInvestigation} disabled={isBusy}>
-                Proceed to Investigation
-              </BubbleButton>
-            )}
-            {error && <p className="text-sm text-red-500">{error}</p>}
-            <BubbleButton onClick={handleLeaveRoom} disabled={isBusy}>Leave Room</BubbleButton>
-          </div>
-        )}
 
-        {/* ── INVESTIGATION ────────────────────────────────────────────── */}
-        {screen === "investigation" && (
-          <div className="space-y-6 sm:space-y-8">
-            <h1 className="text-2xl sm:text-3xl lg:text-4xl">Investigate</h1>
-            <p className="text-base sm:text-lg text-gray-600">
-              Who do you want to investigate? Pick one player.
-            </p>
-
-            {isEliminated ? (
-              <p className="text-gray-400">You've been eliminated and cannot vote.</p>
-            ) : myVote || (uid && roundData?.investigationVotes?.[uid]) ? (
-              <div className="bg-blue-50 border-2 border-blue-200 rounded-3xl p-6">
-                <p className="text-blue-700 font-semibold">
-                  You voted for {playerName(myVote ?? roundData?.investigationVotes?.[uid ?? ""] ?? "")}.
-                </p>
-                <p className="text-gray-500 text-sm mt-1">
-                  Waiting for others ({Object.keys(roundData?.investigationVotes ?? {}).length}/{activePlayers.length - 1} voted)…
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {activePlayers
-                  .filter((p) => p.id !== uid)
-                  .map((p) => (
+            {/* Investigation pre-vote: pick who you suspect is Marco */}
+            <div className="space-y-3">
+              <p className="text-base sm:text-lg font-semibold text-gray-700">
+                Who do you want to investigate?
+              </p>
+              {isEliminated ? (
+                <p className="text-gray-400 text-sm">You've been eliminated and cannot vote.</p>
+              ) : (myVote || roundData?.investigationVotes?.[uid ?? ""]) ? (
+                <div className="bg-blue-50 border-2 border-blue-200 rounded-3xl p-5">
+                  <p className="text-blue-700 font-semibold">
+                    You voted for {playerName(myVote ?? roundData?.investigationVotes?.[uid ?? ""] ?? "")}.
+                  </p>
+                  <p className="text-gray-500 text-sm mt-1">
+                    {Object.keys(roundData?.investigationVotes ?? {}).length}/{activePlayers.length} voted
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {activePlayers.filter((p) => p.id !== uid).map((p) => (
                     <button
                       key={p.id}
                       type="button"
@@ -1055,22 +1383,72 @@ export default function App() {
                       {p.name}
                     </button>
                   ))}
-              </div>
-            )}
+                </div>
+              )}
+            </div>
 
             {error && <p className="text-sm text-red-500">{error}</p>}
             <BubbleButton onClick={handleLeaveRoom} disabled={isBusy}>Leave Room</BubbleButton>
           </div>
         )}
 
+        {/* ── INVESTIGATION ────────────────────────────────────────────── */}
+        {screen === "investigation" && (() => {
+          const investigatedId = savedInvestigatedPlayerId ?? roundData?.investigatedPlayerId ?? null;
+          const investigatedPlayer = investigatedId ? players.find((p) => p.id === investigatedId) : null;
+          // voteComplete is true when all votes have been tallied (even if result is a tie).
+          // Fall back to roundData.roundPhase === "done" so a page reload mid-screen works correctly.
+          const voteComplete = savedVoteComplete || roundData?.roundPhase === "done";
+
+          return (
+            <div className="space-y-6 sm:space-y-8">
+              <RoundProgressBar
+                currentRound={Math.min(room?.currentRound ?? 1, room?.rounds ?? 1)}
+                totalRounds={room?.rounds ?? 1}
+              />
+              <h1 className="text-2xl sm:text-3xl lg:text-4xl">Investigation</h1>
+
+              {voteComplete && investigatedPlayer ? (
+                <>
+                  {/* Result card — intentionally neutral; Marco/not-Marco is only revealed at game-over */}
+                  <div className="rounded-3xl p-8 shadow-xl text-center space-y-3 bg-blue-50 border-4 border-blue-200">
+                    <p className="text-lg text-gray-600">You investigated</p>
+                    <p className="text-4xl font-bold text-gray-900">{investigatedPlayer.name}</p>
+                  </div>
+
+                  <BubbleButton onClick={handleContinueFromInvestigation} disabled={isBusy}>
+                    Continue
+                  </BubbleButton>
+                </>
+              ) : voteComplete ? (
+                <>
+                  <div className="rounded-3xl p-8 shadow-xl text-center space-y-3 bg-gray-50 border-4 border-gray-200">
+                    <p className="text-2xl font-bold text-gray-700">No majority</p>
+                    <p className="text-gray-500">The votes were split — nobody was investigated this round.</p>
+                  </div>
+
+                  <BubbleButton onClick={handleContinueFromInvestigation} disabled={isBusy}>
+                    Continue
+                  </BubbleButton>
+                </>
+              ) : (
+                <div className="text-center py-8">
+                  <p className="text-xl text-gray-500">Investigating…</p>
+                </div>
+              )}
+
+              {error && <p className="text-sm text-red-500">{error}</p>}
+              <BubbleButton onClick={handleLeaveRoom} disabled={isBusy}>Leave Room</BubbleButton>
+            </div>
+          );
+        })()}
+
         {/* ── GAME OVER ────────────────────────────────────────────────── */}
         {screen === "game-over" && (
           <div className="space-y-6 sm:space-y-8">
             <h1 className="text-3xl sm:text-5xl lg:text-6xl">Game Over</h1>
             <div className={`p-8 rounded-3xl shadow-2xl text-4xl sm:text-6xl font-bold ${
-              room?.winner === "Marco"
-                ? "bg-blue-500 text-white"
-                : "bg-yellow-400 text-white"
+              room?.winner === "Marco" ? "bg-blue-500 text-white" : "bg-yellow-400 text-white"
             }`}>
               {room?.winner === "Marco" ? "🏊 Marcos Win! 🏊" : "🎉 Regs Win! 🎉"}
             </div>
@@ -1099,7 +1477,7 @@ export default function App() {
       {/* ── Rules button ──────────────────────────────────────────────────── */}
       <button
         type="button"
-        onClick={() => setShowRules(true)}
+        onClick={() => { setRulesTab("rules"); setShowRules(true); }}
         className="fixed top-4 right-4 z-50 w-10 h-10 rounded-full bg-blue-500 text-white text-xl font-bold shadow-lg flex items-center justify-center hover:bg-blue-600 active:scale-95 transition-all"
         aria-label="Game rules"
       >
@@ -1113,10 +1491,12 @@ export default function App() {
           onClick={() => setShowRules(false)}
         >
           <div
-            className="bg-white rounded-3xl p-6 sm:p-8 shadow-2xl max-w-sm w-full text-left space-y-4"
+            className="bg-white rounded-3xl shadow-2xl max-w-sm w-full text-left flex flex-col"
+            style={{ maxHeight: "80vh" }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
               <h2 className="text-2xl font-bold text-blue-600">How to Play</h2>
               <button
                 type="button"
@@ -1127,16 +1507,172 @@ export default function App() {
                 ×
               </button>
             </div>
-            <ol className="space-y-3 text-sm text-gray-700 list-decimal list-inside leading-relaxed">
-              <li>Don't leak what's on your device!!!</li>
-              <li>One or more players are secretly assigned as <strong>Marcos</strong>. Everyone else is a <strong>Regular</strong>.</li>
-              <li>Marcos know who each other are. Regulars know nothing.</li>
-              <li>Each round, Marcos secretly agree on a player to <strong>eliminate</strong> and pick two photos — a <strong>private</strong> one (only the eliminated player sees) and a <strong>public</strong> one (everyone sees).</li>
-              <li>Each Regular picks one <strong>public photo</strong> to share with the group.</li>
-              <li>The eliminated player sees their private photo and gives the group a <strong>one-word clue</strong>.</li>
-              <li>Everyone votes to <strong>investigate</strong> who they think is a Marco. The most-voted player is revealed.</li>
-              <li><strong>Regs win</strong> by successfully investigating all Marcos. <strong>Marcos win</strong> by surviving all rounds.</li>
-            </ol>
+
+            {/* Tab bar */}
+            <div className="flex gap-2 px-6 pb-3 shrink-0">
+              {(["rules", "setup", "flow"] as const).map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  onClick={() => setRulesTab(tab)}
+                  className={`flex-1 py-1.5 rounded-full text-sm font-semibold transition-all ${
+                    rulesTab === tab
+                      ? "bg-blue-500 text-white shadow"
+                      : "bg-gray-100 text-gray-500 hover:bg-gray-200"
+                  }`}
+                >
+                  {tab === "rules" ? "Rules" : tab === "setup" ? "Setup" : "Flow"}
+                </button>
+              ))}
+            </div>
+
+            {/* Tab content — scrollable */}
+            <div className="overflow-y-auto px-6 pb-6 flex-1">
+
+              {/* ── Tab 1: Rules ── */}
+              {rulesTab === "rules" && (
+                <ol className="space-y-3 text-sm text-gray-700 list-decimal list-inside leading-relaxed">
+                  <li>Don't show your screen to other players!</li>
+                  <li>One or more players are secretly assigned as <strong>Marcos</strong>. Everyone else is a <strong>Regular</strong>.</li>
+                  <li>Marcos know who each other are. Regulars know nothing.</li>
+                  <li>Each round has a <strong>theme</strong>. Every player uploads exactly one photo that fits the theme.</li>
+                  <li>Marcos secretly agree on a player to <strong>eliminate</strong> that round.</li>
+                  <li>The eliminated player is privately shown one of the Marco's photos.</li>
+                  <li>The eliminated player picks a <strong>one-word clue</strong> from a set of options to describe that photo to the group.</li>
+                  <li>Everyone sees all the photos and the clue, then <strong>votes on the photo-reveal screen</strong> to investigate one player.</li>
+                  <li>
+                    If there is no majority vote, nobody is investigated that round.
+                    <ul className="list-disc list-inside mt-1 ml-4 space-y-1 text-gray-500">
+                      <li>A tie counts as no majority — the round simply ends with no investigation.</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <strong>Investigating a player does not reveal their role</strong> — you only find out who is Marco once <em>all</em> Marcos have been successfully investigated.
+                  </li>
+                  <li><strong>Regs win</strong> by successfully investigating all Marcos. <strong>Marcos win</strong> by surviving all rounds without being found.</li>
+                </ol>
+              )}
+
+              {/* ── Tab 2: Setup table ── */}
+              {rulesTab === "setup" && (
+                <div>
+                  <p className="text-xs text-gray-500 mb-3">Number of Marcos and rounds is determined by player count.</p>
+                  <table className="w-full text-sm text-center border-collapse">
+                    <thead>
+                      <tr className="bg-blue-50">
+                        <th className="py-2 px-3 font-semibold text-blue-700 border-b border-blue-100">Players</th>
+                        <th className="py-2 px-3 font-semibold text-blue-700 border-b border-blue-100">Marcos</th>
+                        <th className="py-2 px-3 font-semibold text-blue-700 border-b border-blue-100">Rounds</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[
+                        [4,1,1],[5,1,2],[6,1,3],[7,1,4],
+                        [8,2,3],[9,2,4],[10,2,5],[11,2,6],
+                        [12,3,5],[13,3,6],[14,3,7],[15,3,8],
+                        [16,4,7],[17,4,8],[18,4,9],[19,4,10],
+                      ].map(([players, marcos, rounds], i, arr) => {
+                        const prevMarcos = i > 0 ? arr[i - 1][1] : -1;
+                        const isFirstInGroup = marcos !== prevMarcos;
+                        return (
+                          <tr key={players} className={`${i % 2 === 0 ? "bg-white" : "bg-gray-50"} ${isFirstInGroup && i > 0 ? "border-t-2 border-blue-100" : ""}`}>
+                            <td className="py-1.5 px-3 text-gray-800 font-medium">{players}</td>
+                            <td className="py-1.5 px-3 text-blue-600 font-semibold">{marcos}</td>
+                            <td className="py-1.5 px-3 text-gray-700">{rounds}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  <p className="text-xs text-gray-400 mt-3 text-center">Formula: rounds = players − (2 × Marcos) − 1</p>
+                </div>
+              )}
+
+              {/* ── Tab 3: Game flow diagram ── */}
+              {rulesTab === "flow" && (() => {
+                const Phase = ({ label, sub }: { label: string; sub?: string }) => (
+                  <div className="bg-blue-500 text-white rounded-2xl px-4 py-2 text-center shadow-sm">
+                    <p className="text-sm font-semibold">{label}</p>
+                    {sub && <p className="text-xs opacity-80 mt-0.5">{sub}</p>}
+                  </div>
+                );
+                const Decision = ({ label }: { label: string }) => (
+                  <div className="bg-yellow-400 text-gray-800 rounded-2xl px-4 py-2 text-center shadow-sm border-2 border-yellow-500">
+                    <p className="text-sm font-semibold">{label}</p>
+                  </div>
+                );
+                const Arrow = ({ label }: { label?: string }) => (
+                  <div className="flex flex-col items-center gap-0">
+                    {label && <p className="text-xs text-gray-400">{label}</p>}
+                    <div className="w-px h-4 bg-gray-300" />
+                    <div className="w-0 h-0" style={{ borderLeft: "5px solid transparent", borderRight: "5px solid transparent", borderTop: "6px solid #d1d5db" }} />
+                  </div>
+                );
+                return (
+                  <div className="flex flex-col items-center gap-1 text-xs">
+                    <Phase label="Lobby" sub="Players ready up" />
+                    <Arrow />
+                    <Phase label="Role Reveal" sub="Each player sees Marco or Reg" />
+                    <Arrow />
+                    <Phase label="Theme Reveal" sub="Round theme announced" />
+                    <Arrow />
+                    <Phase label="Photo Upload" sub="Everyone submits one photo" />
+                    <Arrow />
+                    <Phase label="Marco Eliminates" sub="Marcos secretly pick a target" />
+                    <Arrow />
+                    <Phase label="Clue Word" sub="Eliminated player describes Marco's photo" />
+                    <Arrow />
+                    <Phase label="Photo Reveal + Vote" sub="See all photos, vote to investigate" />
+                    <Arrow />
+                    <Phase label="Investigation Result" sub="See who was investigated (or no majority)" />
+                    <Arrow />
+                    <Decision label="All Marcos found?" />
+
+                    {/* Branch: Yes → Regs Win / No → continue */}
+                    <div className="flex w-full items-start justify-center gap-2 mt-1">
+                      {/* Left: Yes */}
+                      <div className="flex flex-col items-center gap-1 flex-1">
+                        <p className="text-xs text-gray-400">Yes</p>
+                        <div className="w-px h-3 bg-gray-300" />
+                        <div className="w-0 h-0" style={{ borderLeft: "5px solid transparent", borderRight: "5px solid transparent", borderTop: "6px solid #d1d5db" }} />
+                        <div className="bg-green-500 text-white rounded-2xl px-3 py-2 text-center shadow-sm w-full">
+                          <p className="text-sm font-semibold">Regs Win! 🎉</p>
+                        </div>
+                      </div>
+
+                      {/* Right: No */}
+                      <div className="flex flex-col items-center gap-1 flex-1">
+                        <p className="text-xs text-gray-400">No</p>
+                        <div className="w-px h-3 bg-gray-300" />
+                        <div className="w-0 h-0" style={{ borderLeft: "5px solid transparent", borderRight: "5px solid transparent", borderTop: "6px solid #d1d5db" }} />
+                        <Decision label="Last round?" />
+                        {/* Sub-branch */}
+                        <div className="flex w-full items-start justify-center gap-2 mt-1">
+                          <div className="flex flex-col items-center gap-1 flex-1">
+                            <p className="text-xs text-gray-400">Yes</p>
+                            <div className="w-px h-3 bg-gray-300" />
+                            <div className="w-0 h-0" style={{ borderLeft: "5px solid transparent", borderRight: "5px solid transparent", borderTop: "6px solid #d1d5db" }} />
+                            <div className="bg-red-500 text-white rounded-2xl px-3 py-2 text-center shadow-sm w-full">
+                              <p className="text-sm font-semibold">Marcos Win!</p>
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-center gap-1 flex-1">
+                            <p className="text-xs text-gray-400">No</p>
+                            <div className="w-px h-3 bg-gray-300" />
+                            <div className="w-0 h-0" style={{ borderLeft: "5px solid transparent", borderRight: "5px solid transparent", borderTop: "6px solid #d1d5db" }} />
+                            <div className="bg-blue-100 text-blue-700 border-2 border-blue-300 rounded-2xl px-3 py-2 text-center shadow-sm w-full">
+                              <p className="text-xs font-semibold">Next Round</p>
+                              <p className="text-xs opacity-70">↑ Theme Reveal</p>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+            </div>
           </div>
         </div>
       )}
