@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BubbleButton } from "./components/BubbleButton";
 import { RoundProgressBar } from "./components/RoundProgressBar";
-import logo from "../assets/bc1bc1c44f6ba6cb1fd8be782ee33922cc6339af.png";
+import { AdSenseBanner } from "./components/AdSenseBanner";
+import logo from "../assets/marco-photo-logo.png";
 import { auth, ensureAnonymousAuth } from "../lib/firebase";
 import {
   advanceRoundFromClue,
@@ -170,9 +171,13 @@ export default function App() {
 
   // Per-round single photo upload
   const roundPhotoInputRef = useRef<HTMLInputElement>(null);
+  const roundCameraInputRef = useRef<HTMLInputElement>(null);
   const [roundPhotoFile, setRoundPhotoFile] = useState<File | null>(null);
   const [isRoundUploading, setIsRoundUploading] = useState(false);
   const [roundUploadError, setRoundUploadError] = useState<string | null>(null);
+
+  // Eliminated player UI state
+  const [showAllPhotosForEliminated, setShowAllPhotosForEliminated] = useState(false);
 
   // Marco elimination state
   const [marcoEliminationTarget, setMarcoEliminationTarget] = useState<string | null>(null);
@@ -203,10 +208,10 @@ export default function App() {
   const [mathInput, setMathInput] = useState("");
   const [mathScore, setMathScore] = useState(0);
   const [mathFeedback, setMathFeedback] = useState<"correct" | null>(null);
-  const debugLastRoomSigRef = useRef<string>("");
-  const debugLastRoundSigRef = useRef<string>("");
-  const debugLastScreenSigRef = useRef<string>("");
-  const debugLastMembershipSigRef = useRef<string>("");
+
+  // Nudge button: shown after 12 s of no phase change during active game screens
+  const phaseChangedAtRef = useRef<number>(Date.now());
+  const [showNudge, setShowNudge] = useState(false);
   // Tracks whether this client has been confirmed in the players list at least
   // once for the current roomId. Used to distinguish "listener not yet loaded"
   // (false positive) from "genuinely removed / kicked" (true positive).
@@ -302,17 +307,10 @@ export default function App() {
     // (guards against the brief window after setRoomId before the first snapshot).
     if (!hasBeenInRoomRef.current) return;
 
-    // We were in the room and are now gone — kicked or cleared.
+    // We were in the room and are now gone — kicked, cleared, or timed out.
+    // Full reload clears stale React state (e.g. game-over stuck with wrong winner).
     hasBeenInRoomRef.current = false;
-    setRoomId(null);
-    setRole(null);
-    setHasRevealedRole(false);
-    setThemeAcknowledgedRound(0);
-    setSavedInvestigatedPlayerId(null);
-    setSavedVoteComplete(false);
-    setMyVote(null);
-    setRoundPhotoFile(null);
-    setScreen("menu");
+    window.location.reload();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, uid, players, room]);
 
@@ -323,30 +321,10 @@ export default function App() {
     if (!roundData || (roundData.roundPhase !== "upload" && roundData.roundPhase !== "action")) return;
     const submissions = roundData.submissions ?? {};
     const subCount = Object.keys(submissions).length;
-    const playerCount = players.length;
-    // #region agent log
-    sendDebugLog("H9", "src/app/App.tsx:advance-effect", "Advance effect evaluated", {
-      subCount,
-      playerCount,
-      roomGamePhase: room.gamePhase,
-      roundPhase: roundData.roundPhase,
-      willAttempt: subCount >= playerCount && playerCount >= 4,
-    });
-    // #endregion
-    if (subCount < playerCount || playerCount < 4) return;
-    advanceRoundToElimination(roomId, room.currentRound)
-      .then(() => {
-        // #region agent log
-        sendDebugLog("H9", "src/app/App.tsx:advance-success", "advanceRoundToElimination resolved", { subCount, playerCount });
-        // #endregion
-      })
-      .catch((err: Error) => {
-        // #region agent log
-        sendDebugLog("H9", "src/app/App.tsx:advance-error", "advanceRoundToElimination rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code });
-        // #endregion
-      });
+    if (subCount < activePlayers.length || players.length < 4) return;
+    advanceRoundToElimination(roomId, room.currentRound).catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.submissions, players.length]);
+  }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.submissions, players.length, room?.eliminatedPlayerIds?.length]);
 
   // ── Client-side elimination→eliminated-reveal transition (Cloud Function fallback) ───
   useEffect(() => {
@@ -355,12 +333,7 @@ export default function App() {
     const confirmed = roundData.marcoConfirmed ?? [];
     const marcoCount = room.marcoCount ?? 1;
     if (confirmed.length < marcoCount || !roundData.marcoSubmission) return;
-    // #region agent log
-    sendDebugLog("H10", "src/app/App.tsx:elim-advance-effect", "elimination→clue attempt", { confirmed: confirmed.length, marcoCount });
-    // #endregion
-    advanceRoundFromElimination(roomId, room.currentRound)
-      .then(() => { sendDebugLog("H10", "src/app/App.tsx:elim-advance-success", "advanceRoundFromElimination resolved", {}); })
-      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:elim-advance-error", "advanceRoundFromElimination rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+    advanceRoundFromElimination(roomId, room.currentRound).catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, room?.currentRound, room?.gamePhase, room?.marcoCount, roundData?.roundPhase, roundData?.marcoConfirmed, roundData?.marcoSubmission]);
 
@@ -369,12 +342,7 @@ export default function App() {
     if (!roomId || !room?.currentRound || room.gamePhase !== "eliminated-reveal") return;
     if (!roundData || roundData.roundPhase !== "clue") return;
     if (!roundData.selectedClue) return;
-    // #region agent log
-    sendDebugLog("H10", "src/app/App.tsx:clue-advance-effect", "clue→reveal attempt", { clue: roundData.selectedClue });
-    // #endregion
-    advanceRoundFromClue(roomId, room.currentRound)
-      .then(() => { sendDebugLog("H10", "src/app/App.tsx:clue-advance-success", "advanceRoundFromClue resolved", {}); })
-      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:clue-advance-error", "advanceRoundFromClue rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+    advanceRoundFromClue(roomId, room.currentRound).catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.selectedClue]);
 
@@ -395,12 +363,7 @@ export default function App() {
     if (!roomId || !room?.currentRound || room.gamePhase !== "photo-reveal") return;
     if (!roundData || roundData.roundPhase !== "reveal") return;
     if (!roundData.advanceToInvestigation) return;
-    // #region agent log
-    sendDebugLog("H10", "src/app/App.tsx:reveal-advance-effect", "reveal→vote attempt", {});
-    // #endregion
-    advanceRoundFromReveal(roomId, room.currentRound)
-      .then(() => { sendDebugLog("H10", "src/app/App.tsx:reveal-advance-success", "advanceRoundFromReveal resolved", {}); })
-      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:reveal-advance-error", "advanceRoundFromReveal rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+    advanceRoundFromReveal(roomId, room.currentRound).catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.advanceToInvestigation]);
 
@@ -431,12 +394,7 @@ export default function App() {
     if (computedWinnerId) setSavedInvestigatedPlayerId(computedWinnerId);
     setSavedVoteComplete(true);
 
-    // #region agent log
-    sendDebugLog("H10", "src/app/App.tsx:vote-advance-effect", "vote→done attempt", { votes: Object.keys(votes).length, eligible: eligibleVoters.length });
-    // #endregion
-    advanceRoundFromVote(roomId, room.currentRound, players)
-      .then(() => { sendDebugLog("H10", "src/app/App.tsx:vote-advance-success", "advanceRoundFromVote resolved", {}); })
-      .catch((err: Error) => { sendDebugLog("H10", "src/app/App.tsx:vote-advance-error", "advanceRoundFromVote rejected", { error: err?.message ?? String(err), code: (err as unknown as Record<string, unknown>)?.code }); });
+    advanceRoundFromVote(roomId, room.currentRound, players).catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, room?.currentRound, room?.gamePhase, roundData?.roundPhase, roundData?.investigationVotes, players]);
 
@@ -466,7 +424,7 @@ export default function App() {
       try { await touchPlayer(roomId); } catch { if (!isActive) return; }
     };
     sendHeartbeat();
-    const interval = window.setInterval(sendHeartbeat, 30_000);
+    const interval = window.setInterval(sendHeartbeat, 5 * 60_000);
     return () => { isActive = false; window.clearInterval(interval); };
   }, [roomId]);
 
@@ -504,6 +462,7 @@ export default function App() {
         if (screen !== "round-upload") {
           setRoundPhotoFile(null);
           setRoundUploadError(null);
+          setIsRoundUploading(false);
           setScreen("round-upload");
         }
         return;
@@ -518,13 +477,14 @@ export default function App() {
       if (room.gamePhase === "eliminated-reveal" && screen !== "eliminated-reveal") {
         setScreen("eliminated-reveal");
         setSelectedClueWord(null);
+        setShowAllPhotosForEliminated(false);
         return;
       }
       if (room.gamePhase === "photo-reveal" && screen !== "photo-reveal") {
         setScreen("photo-reveal");
         return;
       }
-      if (room.gamePhase === "investigation" && screen !== "investigation") {
+      if (room.gamePhase === "investigation" && screen !== "investigation" && screen !== "round-theme") {
         setScreen("investigation");
         setMyVote(null);
         return;
@@ -613,21 +573,16 @@ export default function App() {
     if (!roomId) return;
     if (!window.confirm("Leave the room?")) return;
     setError(null); setIsBusy(true);
+    // Clear before Firestore delete so the kick-detection effect does not also fire.
+    hasBeenInRoomRef.current = false;
     try {
       await leaveRoom(roomId);
-      hasBeenInRoomRef.current = false;
-      setRole(null);
-      setHasRevealedRole(false);
-      setRoundData(null);
-      setThemeAcknowledgedRound(0);
-      setSavedInvestigatedPlayerId(null);
-      setSavedVoteComplete(false);
-      setMyVote(null);
-      setRoundPhotoFile(null);
-      setRoomId(null);
-      setScreen("menu");
-    } catch (err) { setError((err as Error).message); }
-    finally { setIsBusy(false); }
+      window.location.reload();
+    } catch (err) {
+      hasBeenInRoomRef.current = true;
+      setError((err as Error).message);
+      setIsBusy(false);
+    }
   };
 
   const handleRevealRole = () => {
@@ -656,9 +611,14 @@ export default function App() {
     if (!roomId || !room?.currentRound || !roundPhotoFile) return;
     setIsRoundUploading(true);
     setRoundUploadError(null);
-    try { await submitRoundPhoto(roomId, room.currentRound, roundPhotoFile); }
-    catch (err) { setRoundUploadError((err as Error).message); }
-    finally { setIsRoundUploading(false); }
+    try {
+      await submitRoundPhoto(roomId, room.currentRound, roundPhotoFile);
+      // Keep isRoundUploading=true after success to prevent re-submission while
+      // waiting for the Firestore listener to confirm roundData.submissions[uid].
+    } catch (err) {
+      setRoundUploadError((err as Error).message);
+      setIsRoundUploading(false); // Only reset on failure so the user can retry
+    }
   };
 
   // ── Marco elimination ─────────────────────────────────────────────────────
@@ -685,6 +645,46 @@ export default function App() {
     try { await submitClueWord(roomId, room.currentRound, selectedClueWord); }
     catch (err) { setError((err as Error).message); }
     finally { setIsBusy(false); }
+  };
+
+  // ── Nudge: reset timer whenever phase/screen advances ────────────────────
+  useEffect(() => {
+    phaseChangedAtRef.current = Date.now();
+    setShowNudge(false);
+  }, [room?.gamePhase, room?.currentRound, roundData?.roundPhase, screen]);
+
+  useEffect(() => {
+    const activeScreens: GameScreen[] = [
+      "round-upload", "round-elimination", "eliminated-reveal", "photo-reveal", "investigation",
+    ];
+    if (!activeScreens.includes(screen)) { setShowNudge(false); return; }
+    const check = () => {
+      if (Date.now() - phaseChangedAtRef.current >= 12_000) setShowNudge(true);
+    };
+    const id = window.setInterval(check, 2_000);
+    return () => window.clearInterval(id);
+  }, [screen]);
+
+  // ── Nudge handler: re-runs the correct advance check for the current phase ──
+  const handleNudge = async () => {
+    if (!roomId || !room?.currentRound) return;
+    setError(null);
+    const phase = room.gamePhase;
+    try {
+      if (phase === "round-upload" || phase === "round-action") {
+        await advanceRoundToElimination(roomId, room.currentRound);
+      } else if (phase === "round-elimination") {
+        await advanceRoundFromElimination(roomId, room.currentRound);
+      } else if (phase === "eliminated-reveal") {
+        await advanceRoundFromClue(roomId, room.currentRound);
+      } else if (phase === "photo-reveal") {
+        await advanceRoundFromReveal(roomId, room.currentRound);
+      } else if (phase === "investigation") {
+        await advanceRoundFromVote(roomId, room.currentRound, players);
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    }
   };
 
   // ── Photo reveal advance ──────────────────────────────────────────────────
@@ -757,151 +757,6 @@ export default function App() {
     : null;
   const submissionsGrid = Object.entries(roundData?.submissions ?? {});
 
-  const sendDebugLog = (
-    hypothesisId: string,
-    location: string,
-    message: string,
-    data: Record<string, unknown>,
-  ) => {
-    // #region agent log
-    fetch("http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Debug-Session-Id": "d485e8",
-      },
-      body: JSON.stringify({
-        sessionId: "d485e8",
-        runId: "repro1",
-        hypothesisId,
-        location,
-        message,
-        data,
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
-  };
-
-  useEffect(() => {
-    if (!room) return;
-    const sig = JSON.stringify({
-      state: room.state ?? null,
-      gamePhase: room.gamePhase ?? null,
-      currentRound: room.currentRound ?? null,
-      playerCount: room.playerCount ?? null,
-      marcoCount: room.marcoCount ?? null,
-      eliminatedCount: (room.eliminatedPlayerIds ?? []).length,
-    });
-    if (debugLastRoomSigRef.current === sig) return;
-    debugLastRoomSigRef.current = sig;
-    // #region agent log
-    sendDebugLog("H2", "src/app/App.tsx:room-snapshot", "Room snapshot changed", {
-      roomState: room.state ?? null,
-      gamePhase: room.gamePhase ?? null,
-      currentRound: room.currentRound ?? null,
-      playerCount: room.playerCount ?? null,
-      marcoCount: room.marcoCount ?? null,
-      eliminatedPlayerIds: room.eliminatedPlayerIds ?? [],
-    });
-    // #endregion
-  }, [room]);
-
-  useEffect(() => {
-    if (!roundData) return;
-    const submissions = roundData.submissions ?? {};
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const dbg = (roundData as any)._dbgFunctionRan ?? null;
-    const sig = JSON.stringify({
-      roundPhase: roundData.roundPhase ?? null,
-      uploadCount: Object.keys(submissions).length,
-      submissionIds: Object.keys(submissions).sort(),
-      marcoSubmissionBy: roundData.marcoSubmission?.marcoPlayerId ?? null,
-      marcoTarget: roundData.marcoSubmission?.eliminatedPlayerId ?? null,
-      marcoConfirmedCount: (roundData.marcoConfirmed ?? []).length,
-      selectedClue: roundData.selectedClue ?? null,
-      dbgFunctionRanUploadCount: dbg?.uploadCount ?? null,
-    });
-    if (debugLastRoundSigRef.current === sig) return;
-    debugLastRoundSigRef.current = sig;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const dbg2 = (roundData as any)._dbgFunctionRan ?? null;
-    // #region agent log
-    sendDebugLog("H1", "src/app/App.tsx:round-snapshot", "Round snapshot changed", {
-      roundPhase: roundData.roundPhase ?? null,
-      uploadCount: Object.keys(submissions).length,
-      submissionIds: Object.keys(submissions),
-      marcoSubmission: roundData.marcoSubmission ?? null,
-      marcoConfirmed: roundData.marcoConfirmed ?? [],
-      selectedClue: roundData.selectedClue ?? null,
-      advanceToInvestigation: roundData.advanceToInvestigation ?? false,
-      dbgFunctionRan: dbg2 ? { uploadCount: dbg2.uploadCount, totalPlayers: dbg2.totalPlayers, roundPhase: dbg2.roundPhase } : null,
-    });
-    // #endregion
-  }, [roundData]);
-
-  useEffect(() => {
-    const sig = JSON.stringify({
-      screen,
-      roomState: room?.state ?? null,
-      roomPhase: room?.gamePhase ?? null,
-      hasRevealedRole,
-      themeAcknowledgedRound,
-      currentRound: room?.currentRound ?? null,
-    });
-    if (debugLastScreenSigRef.current === sig) return;
-    debugLastScreenSigRef.current = sig;
-    // #region agent log
-    sendDebugLog("H3", "src/app/App.tsx:screen-transition", "Screen/state snapshot", {
-      screen,
-      roomState: room?.state ?? null,
-      roomGamePhase: room?.gamePhase ?? null,
-      hasRevealedRole,
-      themeAcknowledgedRound,
-      currentRound: room?.currentRound ?? null,
-    });
-    // #endregion
-  }, [screen, room?.state, room?.gamePhase, room?.currentRound, hasRevealedRole, themeAcknowledgedRound]);
-
-  useEffect(() => {
-    const playersInRoom = players.map((p) => p.id);
-    const membership = uid ? playersInRoom.includes(uid) : false;
-    const sig = JSON.stringify({
-      uid: uid ?? null,
-      membership,
-      playersCount: players.length,
-      roomPlayerCount: room?.playerCount ?? null,
-      roleState: role ?? null,
-      playerRole: currentPlayer?.role ?? null,
-      effectiveRole: effectiveRole ?? null,
-      isEliminated,
-      roomPhase: room?.gamePhase ?? null,
-    });
-    if (debugLastMembershipSigRef.current === sig) return;
-    debugLastMembershipSigRef.current = sig;
-    // #region agent log
-    sendDebugLog("H4", "src/app/App.tsx:membership-role", "Membership and role snapshot", {
-      uid: uid ?? null,
-      isInPlayersList: membership,
-      playersCount: players.length,
-      roomPlayerCount: room?.playerCount ?? null,
-      localRoleState: role ?? null,
-      serverPlayerRole: currentPlayer?.role ?? null,
-      effectiveRole: effectiveRole ?? null,
-      isEliminated,
-      roomGamePhase: room?.gamePhase ?? null,
-    });
-    // #endregion
-  }, [
-    uid,
-    players,
-    room?.playerCount,
-    role,
-    currentPlayer?.role,
-    effectiveRole,
-    isEliminated,
-    room?.gamePhase,
-  ]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -911,7 +766,7 @@ export default function App() {
         {/* ── MENU ─────────────────────────────────────────────────────── */}
         {screen === "menu" && (
           <div className="space-y-6 sm:space-y-8">
-            <img src={logo} alt="Marco Photo" className="w-full h-auto max-w-4xl mx-auto mb-6 sm:mb-8" />
+            <img src={logo} alt="Marco Photo" className="w-full h-auto max-w-lg mx-auto mb-2 sm:mb-4" />
             <p className="text-base sm:text-lg lg:text-2xl mb-6 sm:mb-8">Get ready for a fun game!</p>
             <div className="flex flex-col items-center gap-3 sm:gap-4">
               <div className="w-full max-w-sm space-y-3">
@@ -934,6 +789,7 @@ export default function App() {
               {!authReady && <p className="text-sm text-red-500">Waiting for sign-in...</p>}
             </div>
             {error && <p className="text-sm text-red-500">{error}</p>}
+            <AdSenseBanner className="pt-2 opacity-90" />
           </div>
         )}
 
@@ -979,6 +835,7 @@ export default function App() {
             )}
             <BubbleButton onClick={handleLeaveRoom} disabled={isBusy}>Leave Room</BubbleButton>
             {error && <p className="text-sm text-red-500">{error}</p>}
+            <AdSenseBanner className="pt-2 opacity-90" />
           </div>
         )}
 
@@ -1059,13 +916,24 @@ export default function App() {
               </div>
             )}
 
-            {uid && roundData?.submissions?.[uid] ? (
+            {isEliminated ? (
+              // Eliminated players sit out — don't upload
+              <div className="space-y-4">
+                <div className="bg-red-50 border-2 border-red-200 rounded-3xl p-6">
+                  <p className="text-xl font-semibold text-red-700">You've been eliminated</p>
+                  <p className="text-gray-500 mt-1">Sit back and watch this round unfold.</p>
+                </div>
+                <p className="text-gray-500">
+                  {Object.keys(roundData?.submissions ?? {}).length}/{activePlayers.length} players submitted
+                </p>
+              </div>
+            ) : uid && roundData?.submissions?.[uid] ? (
               // Already uploaded — show preview and wait
               <div className="space-y-4">
                 <div className="bg-green-50 border-2 border-green-400 rounded-3xl p-6">
                   <p className="text-xl text-green-700 font-semibold">Photo submitted!</p>
                   <p className="text-gray-600 mt-1">
-                    {Object.keys(roundData.submissions).length}/{players.length} players submitted
+                    {Object.keys(roundData.submissions).length}/{activePlayers.length} players submitted
                   </p>
                 </div>
                 <img
@@ -1088,6 +956,14 @@ export default function App() {
                   className="hidden"
                   onChange={handleRoundPhotoChange}
                 />
+                <input
+                  ref={roundCameraInputRef}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  className="hidden"
+                  onChange={handleRoundPhotoChange}
+                />
                 {roundPhotoFile && (
                   <img
                     src={URL.createObjectURL(roundPhotoFile)}
@@ -1097,12 +973,20 @@ export default function App() {
                 )}
                 {roundUploadError && <p className="text-sm text-red-500">{roundUploadError}</p>}
                 <div className="flex flex-col items-center gap-3">
-                  <BubbleButton
-                    onClick={() => roundPhotoInputRef.current?.click()}
-                    disabled={isRoundUploading}
-                  >
-                    {roundPhotoFile ? "Change Photo" : "Select Photo"}
-                  </BubbleButton>
+                  <div className="flex gap-3 justify-center flex-wrap">
+                    <BubbleButton
+                      onClick={() => roundPhotoInputRef.current?.click()}
+                      disabled={isRoundUploading}
+                    >
+                      {roundPhotoFile ? "Change Photo" : "Select Photo"}
+                    </BubbleButton>
+                    <BubbleButton
+                      onClick={() => roundCameraInputRef.current?.click()}
+                      disabled={isRoundUploading}
+                    >
+                      Take Photo
+                    </BubbleButton>
+                  </div>
                   {roundPhotoFile && (
                     <BubbleButton onClick={handleUploadRoundPhoto} disabled={isRoundUploading}>
                       {isRoundUploading ? "Uploading…" : "Upload Photo"}
@@ -1263,6 +1147,39 @@ export default function App() {
                   <p className="text-gray-400">Loading private photo…</p>
                 )}
 
+                {/* Toggle to view all submitted photos for reference */}
+                <button
+                  type="button"
+                  onClick={() => setShowAllPhotosForEliminated((v) => !v)}
+                  className="text-sm font-semibold text-blue-500 hover:text-blue-600 underline"
+                >
+                  {showAllPhotosForEliminated ? "Hide all photos" : "View all photos"}
+                </button>
+                {showAllPhotosForEliminated && (
+                  <div className="space-y-2">
+                    <p className="text-xs text-gray-400 uppercase tracking-wide">All submitted photos</p>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                      {submissionsGrid.map(([playerId, url]) => {
+                        const isMarco = playerId === roundData?.marcoSubmission?.marcoPlayerId;
+                        return (
+                          <div key={playerId} className="space-y-1">
+                            <div className={`rounded-2xl overflow-hidden shadow ${isMarco ? "ring-4 ring-blue-400" : ""}`}>
+                              <img
+                                src={url}
+                                alt={playerName(playerId)}
+                                className="w-full aspect-square object-cover"
+                              />
+                            </div>
+                            <p className="text-xs text-center text-gray-600 truncate font-medium">
+                              {playerName(playerId)}{playerId === uid ? " (you)" : ""}{isMarco ? " 🏊" : ""}
+                            </p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {roundData?.selectedClue ? (
                   <div className="bg-green-50 border-2 border-green-400 rounded-3xl p-6">
                     <p className="text-green-700">
@@ -1394,11 +1311,29 @@ export default function App() {
 
         {/* ── INVESTIGATION ────────────────────────────────────────────── */}
         {screen === "investigation" && (() => {
-          const investigatedId = savedInvestigatedPlayerId ?? roundData?.investigatedPlayerId ?? null;
+          // Compute the winner directly from the votes currently in roundData so this screen
+          // never gets stuck in "Investigating…" waiting for an async flag to be set.
+          const currentVotes = roundData?.investigationVotes ?? {};
+          const allVotesIn = activePlayers.length > 0 &&
+            Object.keys(currentVotes).length >= activePlayers.length;
+          const computedWinnerId = (() => {
+            if (!allVotesIn) return null;
+            const tallies: Record<string, number> = {};
+            for (const v of Object.values(currentVotes)) tallies[v] = (tallies[v] ?? 0) + 1;
+            let max = 0; let tops: string[] = [];
+            for (const [id, count] of Object.entries(tallies)) {
+              if (count > max) { max = count; tops = [id]; }
+              else if (count === max) tops.push(id);
+            }
+            return tops.length === 1 ? tops[0] : null;
+          })();
+          // voteComplete is true as soon as all votes are in (or once saved/Firestore confirms done).
+          const voteComplete = allVotesIn || savedVoteComplete || roundData?.roundPhase === "done";
+          const investigatedId =
+            savedInvestigatedPlayerId ??
+            roundData?.investigatedPlayerId ??
+            computedWinnerId;
           const investigatedPlayer = investigatedId ? players.find((p) => p.id === investigatedId) : null;
-          // voteComplete is true when all votes have been tallied (even if result is a tie).
-          // Fall back to roundData.roundPhase === "done" so a page reload mid-screen works correctly.
-          const voteComplete = savedVoteComplete || roundData?.roundPhase === "done";
 
           return (
             <div className="space-y-6 sm:space-y-8">
@@ -1469,10 +1404,22 @@ export default function App() {
               Completed {room?.currentRound ?? "?"} round{(room?.currentRound ?? 1) !== 1 ? "s" : ""} out of {room?.rounds ?? "?"}.
             </p>
             <BubbleButton onClick={handleLeaveRoom} disabled={isBusy}>Leave Room</BubbleButton>
+            <AdSenseBanner className="pt-2 opacity-90" />
           </div>
         )}
 
       </div>
+
+      {/* ── Nudge button (shown after 12 s of no phase change) ───────────── */}
+      {showNudge && (
+        <button
+          type="button"
+          onClick={handleNudge}
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-5 py-2.5 rounded-full bg-gray-800/80 text-white text-sm font-semibold shadow-xl backdrop-blur-sm hover:bg-gray-700 active:scale-95 transition-all"
+        >
+          Game stuck? Tap to sync
+        </button>
+      )}
 
       {/* ── Rules button ──────────────────────────────────────────────────── */}
       <button

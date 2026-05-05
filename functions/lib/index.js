@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.cleanupRooms = exports.onRoundDocUpdated = exports.onPlayerPhotosUploaded = exports.onRoomStateChanged = exports.onPlayerVotekickUpdated = exports.onRoomDeleted = exports.onRoomCreated = void 0;
+exports.cleanupRooms = exports.onRoundDocUpdated = exports.onRoomStateChanged = exports.onPlayerVotekickUpdated = exports.onRoomDeleted = exports.onRoomCreated = void 0;
 const app_1 = require("firebase-admin/app");
 const firestore_1 = require("firebase-admin/firestore");
 const storage_1 = require("firebase-admin/storage");
@@ -9,30 +9,58 @@ const scheduler_1 = require("firebase-functions/v2/scheduler");
 (0, app_1.initializeApp)();
 const db = (0, firestore_1.getFirestore)();
 const MAIN_ROOM_ID = "main";
-const PRESENCE_TIMEOUT_MS = 30 * 1000;
-const WAITING_PLAYER_TIMEOUT_MS = 10 * 60 * 1000;
+// NOTE: Temporarily disable idle-based player removals for playtesting.
+// (Set these back to reasonable values before production.)
+const PRESENCE_TIMEOUT_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
+const WAITING_PLAYER_TIMEOUT_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
 const GAME_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 const VOTE_KICK_MIN_THRESHOLD = 2;
-const makeEmptyRound = () => ({
-    roundPhase: "action",
-    eliminatedPlayerId: null,
-    privatePhotoUrl: null,
-    marcoSubmissions: {},
+// ── Shared game constants (mirrored from src/lib/gameConstants.ts) ────────────
+const THEMES = [
+    "Nature", "Food & Drink", "Architecture", "Night Life", "Travel",
+    "Everyday Life", "Art & Culture", "Sports & Fitness", "Weather",
+    "Urban Streets", "Water & Ocean", "Celebrations", "Work & Study",
+    "Family & Friends", "Pets & Animals", "Sunsets & Skies", "Markets & Shops",
+    "Texture & Patterns", "Motion & Speed", "Silence & Stillness",
+];
+const CLUE_BANK = [
+    "calm", "tense", "lonely", "joyful", "awkward", "nostalgic", "hopeful", "uneasy",
+    "broken", "messy", "clean", "dark", "bright", "fragile", "worn", "fresh",
+    "hidden", "open", "empty", "crowded", "weird", "normal", "lost", "found",
+    "moving", "still", "waiting", "rushing", "stuck", "fleeting", "heavy", "light",
+    "sharp", "blurry", "loud", "quiet", "rough", "smooth", "warm", "cold",
+    "together", "apart", "watched", "ignored", "contained", "free", "grounded", "floating",
+];
+const pickClueOptions = (n) => {
+    const shuffled = [...CLUE_BANK].sort(() => Math.random() - 0.5);
+    return shuffled.slice(0, n);
+};
+const pickUnusedTheme = (usedThemes) => {
+    const available = THEMES.filter((t) => !usedThemes.includes(t));
+    const pool = available.length > 0 ? available : THEMES;
+    return pool[Math.floor(Math.random() * pool.length)];
+};
+const makeEmptyRound = (theme, clueOptions) => ({
+    roundPhase: "upload",
+    theme,
+    clueOptions,
+    submissions: {},
+    marcoSubmission: null,
     marcoConfirmed: [],
-    publicPhotoUrls: {},
-    eliminatedClue: null,
+    eliminatedPlayerId: null,
+    selectedClue: null,
     investigationVotes: {},
     investigatedPlayerId: null,
     advanceToInvestigation: false,
 });
-// ── Room stats ──────────────────────────────────────────────────────────────
+// ── Room stats ───────────────────────────────────────────────────────────────
 exports.onRoomCreated = (0, firestore_2.onDocumentCreated)("rooms/{roomId}", async () => {
     await db.doc("stats/rooms").set({ count: firestore_1.FieldValue.increment(1), updatedAt: firestore_1.FieldValue.serverTimestamp() }, { merge: true });
 });
 exports.onRoomDeleted = (0, firestore_2.onDocumentDeleted)("rooms/{roomId}", async () => {
     await db.doc("stats/rooms").set({ count: firestore_1.FieldValue.increment(-1), updatedAt: firestore_1.FieldValue.serverTimestamp() }, { merge: true });
 });
-// ── Votekick: server-side player removal ────────────────────────────────────
+// ── Votekick: server-side player removal ─────────────────────────────────────
 exports.onPlayerVotekickUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/players/{playerId}", async (event) => {
     var _a, _b, _c, _d, _e, _f;
     const before = (_a = event.data) === null || _a === void 0 ? void 0 : _a.before.data();
@@ -69,7 +97,7 @@ exports.onPlayerVotekickUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roo
     await batch.commit();
     console.log(`[onPlayerVotekickUpdated] kicked ${playerId}, playerCount now ${nextCount}`);
 });
-// ── Votekick count reset when room goes back to waiting ─────────────────────
+// ── Reset when room goes back to waiting ─────────────────────────────────────
 exports.onRoomStateChanged = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}", async (event) => {
     var _a, _b, _c;
     const before = (_a = event.data) === null || _a === void 0 ? void 0 : _a.before.data();
@@ -82,38 +110,29 @@ exports.onRoomStateChanged = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}"
     const roomRef = db.doc(`rooms/${roomId}`);
     const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
     const batch = db.batch();
-    // Always reset votekick data on all remaining players
     for (const playerDoc of playersSnap.docs) {
         const playerData = playerDoc.data();
         const playerUpdates = {};
         if (((_c = playerData.votekickCount) !== null && _c !== void 0 ? _c : 0) > 0)
             playerUpdates.votekickCount = 0;
-        // Clear game-specific fields if the game was in progress
         if (wasPlaying) {
             if (playerData.role !== undefined)
                 playerUpdates.role = firestore_1.FieldValue.delete();
-            if (playerData.photoUrls !== undefined)
-                playerUpdates.photoUrls = firestore_1.FieldValue.delete();
-            if (playerData.usedPhotoUrls !== undefined)
-                playerUpdates.usedPhotoUrls = firestore_1.FieldValue.delete();
-            if (playerData.hasUploadedPhotos !== undefined)
-                playerUpdates.hasUploadedPhotos = firestore_1.FieldValue.delete();
             playerUpdates.isReady = false;
         }
-        if (Object.keys(playerUpdates).length > 0) {
+        if (Object.keys(playerUpdates).length > 0)
             batch.update(playerDoc.ref, playerUpdates);
-        }
         const votesSnap = await playerDoc.ref.collection("votes").get();
         for (const voteDoc of votesSnap.docs)
             batch.delete(voteDoc.ref);
     }
-    // Clear game fields from the room doc
     if (wasPlaying) {
         batch.update(roomRef, {
             gamePhase: firestore_1.FieldValue.delete(),
             currentRound: firestore_1.FieldValue.delete(),
             eliminatedPlayerIds: firestore_1.FieldValue.delete(),
             investigatedPlayerIds: firestore_1.FieldValue.delete(),
+            usedThemes: firestore_1.FieldValue.delete(),
             winner: firestore_1.FieldValue.delete(),
             marcoCount: firestore_1.FieldValue.delete(),
             rounds: firestore_1.FieldValue.delete(),
@@ -122,8 +141,27 @@ exports.onRoomStateChanged = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}"
         console.log(`[onRoomStateChanged] cleared all game fields for ${roomId}`);
     }
     await batch.commit();
-    // Delete all photos uploaded for this room from Storage
     if (wasPlaying) {
+        // Delete all round subdocs so the next game starts with a clean slate
+        try {
+            const roundsSnap = await db.collection(`rooms/${roomId}/rounds`).get();
+            if (!roundsSnap.empty) {
+                const roundBatch = db.batch();
+                for (const roundDoc of roundsSnap.docs) {
+                    // Delete private subcollection docs first
+                    const privateSnap = await roundDoc.ref.collection("private").get();
+                    for (const privateDoc of privateSnap.docs)
+                        roundBatch.delete(privateDoc.ref);
+                    roundBatch.delete(roundDoc.ref);
+                }
+                await roundBatch.commit();
+                console.log(`[onRoomStateChanged] deleted ${roundsSnap.size} round doc(s) for ${roomId}`);
+            }
+        }
+        catch (err) {
+            console.warn(`[onRoomStateChanged] failed to delete round docs for ${roomId}:`, err);
+        }
+        // Delete all photos uploaded for this room from Storage
         try {
             const bucket = (0, storage_1.getStorage)().bucket();
             await bucket.deleteFiles({ prefix: `marcophotos/${roomId}/` });
@@ -134,46 +172,9 @@ exports.onRoomStateChanged = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}"
         }
     }
 });
-// ── Photo upload complete → start round 1 ───────────────────────────────────
-exports.onPlayerPhotosUploaded = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/players/{playerId}", async (event) => {
-    var _a, _b;
-    const before = (_a = event.data) === null || _a === void 0 ? void 0 : _a.before.data();
-    const after = (_b = event.data) === null || _b === void 0 ? void 0 : _b.after.data();
-    if (!before || !after)
-        return;
-    if (before.hasUploadedPhotos === after.hasUploadedPhotos)
-        return;
-    if (!after.hasUploadedPhotos)
-        return;
-    const { roomId } = event.params;
-    const roomRef = db.doc(`rooms/${roomId}`);
-    const roomSnap = await roomRef.get();
-    if (!roomSnap.exists)
-        return;
-    const roomData = roomSnap.data();
-    if (roomData.state !== "playing" || roomData.gamePhase)
-        return;
-    const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
-    const allUploaded = playersSnap.docs.every((d) => d.data().hasUploadedPhotos === true);
-    if (!allUploaded) {
-        console.log(`[onPlayerPhotosUploaded] waiting for more players to upload`);
-        return;
-    }
-    const round1Ref = db.doc(`rooms/${roomId}/rounds/1`);
-    await round1Ref.set(makeEmptyRound());
-    await roomRef.update({
-        gamePhase: "round-action",
-        currentRound: 1,
-        eliminatedPlayerIds: [],
-        investigatedPlayerIds: [],
-        winner: null,
-        lastActiveAt: firestore_1.FieldValue.serverTimestamp(),
-    });
-    console.log(`[onPlayerPhotosUploaded] all uploaded — round 1 started for ${roomId}`);
-});
-// ── Round doc phase transitions ──────────────────────────────────────────────
+// ── Round doc phase transitions ───────────────────────────────────────────────
 exports.onRoundDocUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/rounds/{roundNum}", async (event) => {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s;
     const before = (_a = event.data) === null || _a === void 0 ? void 0 : _a.before.data();
     const after = (_b = event.data) === null || _b === void 0 ? void 0 : _b.after.data();
     if (!before || !after)
@@ -185,31 +186,52 @@ exports.onRoundDocUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/r
     if (!roomSnap.exists)
         return;
     const roomData = roomSnap.data();
-    // ── Phase 1 → 2: all Marcos confirmed + all active Regs submitted ────────
-    if (after.roundPhase === "action") {
-        const marcoCount = (_c = roomData.marcoCount) !== null && _c !== void 0 ? _c : 1;
-        const confirmed = (_d = after.marcoConfirmed) !== null && _d !== void 0 ? _d : [];
-        if (confirmed.length < marcoCount)
-            return;
-        const confirmedMarcoId = confirmed[0];
-        const confirmedSubmission = (_e = after.marcoSubmissions) === null || _e === void 0 ? void 0 : _e[confirmedMarcoId];
-        if (!confirmedSubmission)
+    // ── Phase 1: upload → elimination ────────────────────────────────────────
+    if (after.roundPhase === "upload") {
+        if (roomData.gamePhase !== "round-upload" && roomData.gamePhase !== "round-action")
             return;
         const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
-        const eliminatedIds = (_f = roomData.eliminatedPlayerIds) !== null && _f !== void 0 ? _f : [];
-        const activeRegs = playersSnap.docs.filter((d) => d.data().role !== "Marco" && !eliminatedIds.includes(d.id));
-        const publicPhotoUrls = (_g = after.publicPhotoUrls) !== null && _g !== void 0 ? _g : {};
-        const allRegsSubmitted = activeRegs.every((d) => !!publicPhotoUrls[d.id]);
-        if (!allRegsSubmitted)
+        const submissions = (_c = after.submissions) !== null && _c !== void 0 ? _c : {};
+        const eliminatedIds = (_d = roomData.eliminatedPlayerIds) !== null && _d !== void 0 ? _d : [];
+        const activePlayerCount = playersSnap.docs.filter((d) => !eliminatedIds.includes(d.id)).length;
+        const totalPlayers = activePlayerCount;
+        if (Object.keys(submissions).length < totalPlayers)
             return;
-        console.log(`[onRoundDocUpdated] All actions complete — advancing to clue, round ${roundNum}`);
-        const newEliminatedIds = [...eliminatedIds, confirmedSubmission.eliminatedPlayerId];
+        console.log(`[onRoundDocUpdated] All photos submitted — advancing to elimination, round ${roundNum}`);
         const batch = db.batch();
+        batch.update(roundRef, { roundPhase: "elimination" });
+        batch.update(roomRef, { gamePhase: "round-elimination", lastActiveAt: firestore_1.FieldValue.serverTimestamp() });
+        await batch.commit();
+        return;
+    }
+    // ── Phase 2: elimination → clue ──────────────────────────────────────────
+    if (after.roundPhase === "elimination") {
+        if (roomData.gamePhase !== "round-elimination")
+            return;
+        const marcoCount = (_e = roomData.marcoCount) !== null && _e !== void 0 ? _e : 1;
+        const confirmed = (_f = after.marcoConfirmed) !== null && _f !== void 0 ? _f : [];
+        if (confirmed.length < marcoCount)
+            return;
+        const marcoSubmission = after.marcoSubmission;
+        if (!marcoSubmission)
+            return;
+        const { eliminatedPlayerId, marcoPlayerId } = marcoSubmission;
+        const submissions = (_g = after.submissions) !== null && _g !== void 0 ? _g : {};
+        const marcoPhotoUrl = (_h = submissions[marcoPlayerId]) !== null && _h !== void 0 ? _h : null;
+        if (!marcoPhotoUrl) {
+            console.warn(`[onRoundDocUpdated] Marco ${marcoPlayerId} has no submission, cannot advance`);
+            return;
+        }
+        const eliminatedIds = (_j = roomData.eliminatedPlayerIds) !== null && _j !== void 0 ? _j : [];
+        const newEliminatedIds = [...eliminatedIds, eliminatedPlayerId];
+        console.log(`[onRoundDocUpdated] Marco action confirmed — advancing to clue, round ${roundNum}`);
+        const batch = db.batch();
+        // Write private doc readable only by the eliminated player
+        const privateRef = db.doc(`rooms/${roomId}/rounds/${roundNum}/private/reveal`);
+        batch.set(privateRef, { marcoPhotoUrl, forPlayerId: eliminatedPlayerId });
         batch.update(roundRef, {
             roundPhase: "clue",
-            eliminatedPlayerId: confirmedSubmission.eliminatedPlayerId,
-            privatePhotoUrl: confirmedSubmission.privatePhotoUrl,
-            [`publicPhotoUrls.${confirmedMarcoId}`]: confirmedSubmission.publicPhotoUrl,
+            eliminatedPlayerId,
         });
         batch.update(roomRef, {
             gamePhase: "eliminated-reveal",
@@ -219,8 +241,10 @@ exports.onRoundDocUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/r
         await batch.commit();
         return;
     }
-    // ── Phase 2 → 3: eliminated clue submitted ───────────────────────────────
-    if (after.roundPhase === "clue" && !before.eliminatedClue && after.eliminatedClue) {
+    // ── Phase 3: clue → reveal ───────────────────────────────────────────────
+    if (after.roundPhase === "clue" && !before.selectedClue && after.selectedClue) {
+        if (roomData.gamePhase !== "eliminated-reveal")
+            return;
         console.log(`[onRoundDocUpdated] Clue submitted — advancing to reveal, round ${roundNum}`);
         const batch = db.batch();
         batch.update(roundRef, { roundPhase: "reveal" });
@@ -228,8 +252,15 @@ exports.onRoundDocUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/r
         await batch.commit();
         return;
     }
-    // ── Phase 3 → 4: advance to investigation ────────────────────────────────
+    // ── Phase 4: reveal → vote ───────────────────────────────────────────────
     if (after.roundPhase === "reveal" && after.advanceToInvestigation && !before.advanceToInvestigation) {
+        // Guard: skip stale/duplicate CF invocations — only advance if room is still in photo-reveal.
+        // Without this, a late Phase 4 invocation can overwrite "round-upload" back to "investigation"
+        // after Phase 5 has already advanced the game to the next round.
+        if (roomData.gamePhase !== "photo-reveal") {
+            console.log(`[onRoundDocUpdated] Phase 4 skipped for round ${roundNum} — room gamePhase is ${roomData.gamePhase}, not photo-reveal`);
+            return;
+        }
         console.log(`[onRoundDocUpdated] Advancing to investigation, round ${roundNum}`);
         const batch = db.batch();
         batch.update(roundRef, { roundPhase: "vote" });
@@ -237,18 +268,20 @@ exports.onRoundDocUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/r
         await batch.commit();
         return;
     }
-    // ── Phase 4: tally investigation votes ───────────────────────────────────
+    // ── Phase 5: vote → done ─────────────────────────────────────────────────
     if (after.roundPhase === "vote") {
-        const votes = (_h = after.investigationVotes) !== null && _h !== void 0 ? _h : {};
+        if (roomData.gamePhase !== "investigation")
+            return;
+        const votes = (_k = after.investigationVotes) !== null && _k !== void 0 ? _k : {};
         const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
-        const eliminatedIds = (_j = roomData.eliminatedPlayerIds) !== null && _j !== void 0 ? _j : [];
+        const eliminatedIds = (_l = roomData.eliminatedPlayerIds) !== null && _l !== void 0 ? _l : [];
         const eligibleVoters = playersSnap.docs.filter((d) => !eliminatedIds.includes(d.id));
         if (Object.keys(votes).length < eligibleVoters.length)
             return;
-        // Tally
+        // Tally votes
         const tallies = {};
         for (const targetId of Object.values(votes)) {
-            tallies[targetId] = ((_k = tallies[targetId]) !== null && _k !== void 0 ? _k : 0) + 1;
+            tallies[targetId] = ((_m = tallies[targetId]) !== null && _m !== void 0 ? _m : 0) + 1;
         }
         let maxVotes = 0;
         let topTargets = [];
@@ -264,15 +297,23 @@ exports.onRoundDocUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/r
         const isTie = topTargets.length > 1;
         const investigatedPlayerId = isTie ? null : topTargets[0];
         const newInvestigatedIds = investigatedPlayerId
-            ? [...((_l = roomData.investigatedPlayerIds) !== null && _l !== void 0 ? _l : []), investigatedPlayerId]
-            : ((_m = roomData.investigatedPlayerIds) !== null && _m !== void 0 ? _m : []);
+            ? [...((_o = roomData.investigatedPlayerIds) !== null && _o !== void 0 ? _o : []), investigatedPlayerId]
+            : ((_p = roomData.investigatedPlayerIds) !== null && _p !== void 0 ? _p : []);
         const marcoIds = playersSnap.docs
             .filter((d) => d.data().role === "Marco")
             .map((d) => d.id);
         const allMarcosInvestigated = marcoIds.every((id) => newInvestigatedIds.includes(id));
-        const currentRound = (_o = roomData.currentRound) !== null && _o !== void 0 ? _o : 1;
-        const roundLimit = (_p = roomData.rounds) !== null && _p !== void 0 ? _p : 3;
-        console.log(`[onRoundDocUpdated] Votes tallied, round ${roundNum}. Tie=${isTie}, investigated=${investigatedPlayerId}`);
+        // Use the round path param (not roomData.currentRound) so a client-side advance that already
+        // incremented currentRound doesn't cause the CF to misread this as the final round.
+        const currentRound = parseInt(roundNum);
+        const roundLimit = (_q = roomData.rounds) !== null && _q !== void 0 ? _q : 2;
+        // Guard: if the client already advanced past this round, skip CF processing to avoid
+        // a race where both client and CF both advance and the CF incorrectly ends the game.
+        if (((_r = roomData.currentRound) !== null && _r !== void 0 ? _r : 1) > currentRound) {
+            console.log(`[onRoundDocUpdated] Round ${roundNum} already advanced by client (room at ${roomData.currentRound}), skipping vote→done CF step`);
+            return;
+        }
+        console.log(`[onRoundDocUpdated] Votes tallied, round ${roundNum}. Tie=${isTie}, investigated=${investigatedPlayerId}, currentRound=${currentRound}, roundLimit=${roundLimit}`);
         const batch = db.batch();
         batch.update(roundRef, { roundPhase: "done", investigatedPlayerId: investigatedPlayerId !== null && investigatedPlayerId !== void 0 ? investigatedPlayerId : null });
         if (allMarcosInvestigated) {
@@ -295,13 +336,18 @@ exports.onRoundDocUpdated = (0, firestore_2.onDocumentUpdated)("rooms/{roomId}/r
         }
         else {
             const nextRound = currentRound + 1;
-            console.log(`[onRoundDocUpdated] Starting round ${nextRound}`);
+            const priorUsedThemes = (_s = roomData.usedThemes) !== null && _s !== void 0 ? _s : [];
+            const nextTheme = pickUnusedTheme(priorUsedThemes);
+            const newUsedThemes = priorUsedThemes.length < 20 ? [...priorUsedThemes, nextTheme] : [nextTheme];
+            const nextClueOptions = pickClueOptions(10);
+            console.log(`[onRoundDocUpdated] Starting round ${nextRound} — theme: ${nextTheme}`);
             const nextRoundRef = db.doc(`rooms/${roomId}/rounds/${nextRound}`);
-            batch.set(nextRoundRef, makeEmptyRound());
+            batch.set(nextRoundRef, makeEmptyRound(nextTheme, nextClueOptions));
             batch.update(roomRef, {
-                gamePhase: "round-action",
+                gamePhase: "round-upload",
                 currentRound: nextRound,
                 investigatedPlayerIds: newInvestigatedIds,
+                usedThemes: newUsedThemes,
                 lastActiveAt: firestore_1.FieldValue.serverTimestamp(),
             });
         }

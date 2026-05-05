@@ -8,8 +8,10 @@ initializeApp();
 
 const db = getFirestore();
 const MAIN_ROOM_ID = "main";
-const PRESENCE_TIMEOUT_MS = 30 * 1000;
-const WAITING_PLAYER_TIMEOUT_MS = 10 * 60 * 1000;
+// NOTE: Temporarily disable idle-based player removals for playtesting.
+// (Set these back to reasonable values before production.)
+const PRESENCE_TIMEOUT_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
+const WAITING_PLAYER_TIMEOUT_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
 const GAME_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 const VOTE_KICK_MIN_THRESHOLD = 2;
 
@@ -37,7 +39,11 @@ const pickClueOptions = (n: number): string[] => {
   return shuffled.slice(0, n);
 };
 
-const pickTheme = (): string => THEMES[Math.floor(Math.random() * THEMES.length)];
+const pickUnusedTheme = (usedThemes: string[]): string => {
+  const available = THEMES.filter((t) => !usedThemes.includes(t));
+  const pool = available.length > 0 ? available : THEMES;
+  return pool[Math.floor(Math.random() * pool.length)];
+};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -50,6 +56,7 @@ type RoomDataServer = {
   currentRound?: number;
   eliminatedPlayerIds?: string[];
   investigatedPlayerIds?: string[];
+  usedThemes?: string[];
   waitingSince?: Timestamp | null;
 };
 
@@ -81,31 +88,6 @@ const makeEmptyRound = (theme: string, clueOptions: string[]) => ({
   advanceToInvestigation: false,
 });
 
-const sendDebugLog = (
-  hypothesisId: string,
-  location: string,
-  message: string,
-  data: Record<string, unknown>,
-) => {
-  // #region agent log
-  fetch("http://127.0.0.1:7405/ingest/d453ec47-2b73-4a1b-bd86-9e13d383d1b3", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "d485e8",
-    },
-    body: JSON.stringify({
-      sessionId: "d485e8",
-      runId: "repro2",
-      hypothesisId,
-      location,
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  // #endregion
-};
 
 // ── Room stats ───────────────────────────────────────────────────────────────
 
@@ -199,6 +181,7 @@ export const onRoomStateChanged = onDocumentUpdated("rooms/{roomId}", async (eve
       currentRound: FieldValue.delete(),
       eliminatedPlayerIds: FieldValue.delete(),
       investigatedPlayerIds: FieldValue.delete(),
+      usedThemes: FieldValue.delete(),
       winner: FieldValue.delete(),
       marcoCount: FieldValue.delete(),
       rounds: FieldValue.delete(),
@@ -257,19 +240,12 @@ export const onRoundDocUpdated = onDocumentUpdated(
 
     // ── Phase 1: upload → elimination ────────────────────────────────────────
     if (after.roundPhase === "upload") {
+      if (roomData.gamePhase !== "round-upload" && roomData.gamePhase !== "round-action") return;
       const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
       const submissions = after.submissions ?? {};
-      const totalPlayers = playersSnap.size;
-      // #region agent log — Firestore breadcrumb readable by client
-      await roundRef.update({
-        _dbgFunctionRan: {
-          at: FieldValue.serverTimestamp(),
-          uploadCount: Object.keys(submissions).length,
-          totalPlayers,
-          roundPhase: after.roundPhase ?? null,
-        },
-      }).catch(() => {});
-      // #endregion
+      const eliminatedIds = roomData.eliminatedPlayerIds ?? [];
+      const activePlayerCount = playersSnap.docs.filter((d) => !eliminatedIds.includes(d.id)).length;
+      const totalPlayers = activePlayerCount;
 
       if (Object.keys(submissions).length < totalPlayers) return;
 
@@ -283,6 +259,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
 
     // ── Phase 2: elimination → clue ──────────────────────────────────────────
     if (after.roundPhase === "elimination") {
+      if (roomData.gamePhase !== "round-elimination") return;
       const marcoCount = roomData.marcoCount ?? 1;
       const confirmed = after.marcoConfirmed ?? [];
       if (confirmed.length < marcoCount) return;
@@ -324,6 +301,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
 
     // ── Phase 3: clue → reveal ───────────────────────────────────────────────
     if (after.roundPhase === "clue" && !before.selectedClue && after.selectedClue) {
+      if (roomData.gamePhase !== "eliminated-reveal") return;
       console.log(`[onRoundDocUpdated] Clue submitted — advancing to reveal, round ${roundNum}`);
       const batch = db.batch();
       batch.update(roundRef, { roundPhase: "reveal" });
@@ -334,6 +312,13 @@ export const onRoundDocUpdated = onDocumentUpdated(
 
     // ── Phase 4: reveal → vote ───────────────────────────────────────────────
     if (after.roundPhase === "reveal" && after.advanceToInvestigation && !before.advanceToInvestigation) {
+      // Guard: skip stale/duplicate CF invocations — only advance if room is still in photo-reveal.
+      // Without this, a late Phase 4 invocation can overwrite "round-upload" back to "investigation"
+      // after Phase 5 has already advanced the game to the next round.
+      if (roomData.gamePhase !== "photo-reveal") {
+        console.log(`[onRoundDocUpdated] Phase 4 skipped for round ${roundNum} — room gamePhase is ${roomData.gamePhase}, not photo-reveal`);
+        return;
+      }
       console.log(`[onRoundDocUpdated] Advancing to investigation, round ${roundNum}`);
       const batch = db.batch();
       batch.update(roundRef, { roundPhase: "vote" });
@@ -344,6 +329,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
 
     // ── Phase 5: vote → done ─────────────────────────────────────────────────
     if (after.roundPhase === "vote") {
+      if (roomData.gamePhase !== "investigation") return;
       const votes = after.investigationVotes ?? {};
       const playersSnap = await db.collection(`rooms/${roomId}/players`).get();
       const eliminatedIds = roomData.eliminatedPlayerIds ?? [];
@@ -373,10 +359,19 @@ export const onRoundDocUpdated = onDocumentUpdated(
         .filter((d) => d.data().role === "Marco")
         .map((d) => d.id);
       const allMarcosInvestigated = marcoIds.every((id) => newInvestigatedIds.includes(id));
-      const currentRound = roomData.currentRound ?? 1;
+      // Use the round path param (not roomData.currentRound) so a client-side advance that already
+      // incremented currentRound doesn't cause the CF to misread this as the final round.
+      const currentRound = parseInt(roundNum);
       const roundLimit = roomData.rounds ?? 2;
 
-      console.log(`[onRoundDocUpdated] Votes tallied, round ${roundNum}. Tie=${isTie}, investigated=${investigatedPlayerId}`);
+      // Guard: if the client already advanced past this round, skip CF processing to avoid
+      // a race where both client and CF both advance and the CF incorrectly ends the game.
+      if ((roomData.currentRound ?? 1) > currentRound) {
+        console.log(`[onRoundDocUpdated] Round ${roundNum} already advanced by client (room at ${roomData.currentRound}), skipping vote→done CF step`);
+        return;
+      }
+
+      console.log(`[onRoundDocUpdated] Votes tallied, round ${roundNum}. Tie=${isTie}, investigated=${investigatedPlayerId}, currentRound=${currentRound}, roundLimit=${roundLimit}`);
 
       const batch = db.batch();
       batch.update(roundRef, { roundPhase: "done", investigatedPlayerId: investigatedPlayerId ?? null });
@@ -399,7 +394,9 @@ export const onRoundDocUpdated = onDocumentUpdated(
         });
       } else {
         const nextRound = currentRound + 1;
-        const nextTheme = pickTheme();
+        const priorUsedThemes = roomData.usedThemes ?? [];
+        const nextTheme = pickUnusedTheme(priorUsedThemes);
+        const newUsedThemes = priorUsedThemes.length < 20 ? [...priorUsedThemes, nextTheme] : [nextTheme];
         const nextClueOptions = pickClueOptions(10);
         console.log(`[onRoundDocUpdated] Starting round ${nextRound} — theme: ${nextTheme}`);
         const nextRoundRef = db.doc(`rooms/${roomId}/rounds/${nextRound}`);
@@ -408,6 +405,7 @@ export const onRoundDocUpdated = onDocumentUpdated(
           gamePhase: "round-upload",
           currentRound: nextRound,
           investigatedPlayerIds: newInvestigatedIds,
+          usedThemes: newUsedThemes,
           lastActiveAt: FieldValue.serverTimestamp(),
         });
       }

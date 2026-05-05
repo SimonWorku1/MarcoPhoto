@@ -55,7 +55,7 @@ service cloud.firestore {
           .hasOnly(["playerCount", "lastActiveAt", "waitingSince", "state",
                     "marcoCount", "rounds",
                     "gamePhase", "currentRound", "eliminatedPlayerIds",
-                    "investigatedPlayerIds", "winner"]);
+                    "investigatedPlayerIds", "usedThemes", "winner"]);
       allow delete: if false;
 
       match /players/{playerId} {

@@ -1,5 +1,5 @@
 import React from "react";
-import marcoPolo from "../../assets/marco-polo.jpg";
+import marcoPolo from "../../assets/marco-polo.gif";
 
 interface Props {
   currentRound: number;
@@ -53,8 +53,8 @@ export function RoundProgressBar({ currentRound, totalRounds }: Props) {
           <img
             src={marcoPolo}
             alt="Marco Polo"
-            className="w-12 h-12 object-cover rounded-xl shadow-lg border-2 border-white"
-            style={{ marginBottom: "2px" }}
+            className="w-32 h-32 sm:w-40 sm:h-40 object-contain drop-shadow-xl"
+            style={{ marginBottom: "6px" }}
           />
           {/* Small pointer triangle */}
           <div
@@ -62,7 +62,7 @@ export function RoundProgressBar({ currentRound, totalRounds }: Props) {
             style={{
               borderLeft: "6px solid transparent",
               borderRight: "6px solid transparent",
-              borderTop: "7px solid white",
+              borderTop: "7px solid #facc15",
             }}
           />
         </div>

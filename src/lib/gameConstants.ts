@@ -47,3 +47,9 @@ export const CLUE_BANK: string[] = [
 
 export const pickClueOptions = (n = 10): string[] =>
   shuffle(CLUE_BANK).slice(0, n);
+
+export const pickUnusedTheme = (usedThemes: string[]): string => {
+  const available = THEMES.filter((t) => !usedThemes.includes(t));
+  const pool = available.length > 0 ? available : THEMES;
+  return pool[Math.floor(Math.random() * pool.length)];
+};
