@@ -1,0 +1,42 @@
+name: Rotate help button shape
+
+on:
+  schedule:
+    # Every 8 hours (00:00, 08:00, 16:00 UTC)
+    - cron: "0 */8 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  rotate-shape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cycle help button shape (circle -> square -> star)
+        run: |
+          FILE="src/app/App.tsx"
+          current="$(grep -oE 'const HELP_BUTTON_SHAPE = "[a-z]+"' "$FILE" | grep -oE '"[a-z]+"' | tr -d '"')"
+          case "$current" in
+            circle) next="square" ;;
+            square) next="star" ;;
+            star)   next="circle" ;;
+            *)      next="circle" ;;
+          esac
+          echo "Rotating help button shape: ${current:-unknown} -> ${next}"
+          sed -i "s/const HELP_BUTTON_SHAPE = \"${current}\";/const HELP_BUTTON_SHAPE = \"${next}\";/" "$FILE"
+
+      - name: Commit and push if there are changes
+        run: |
+          git config user.name "Simon Worku"
+          git config user.email "143561285+SimonWorku1@users.noreply.github.com"
+          git add src/app/App.tsx
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Rotate help button shape: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push origin HEAD:${GITHUB_REF_NAME}

@@ -56,6 +56,29 @@ type GameScreen =
   | "game-over";
 type Role = "Marco" | "Reg";
 
+// Shape of the floating help (?) button. Cycled on a schedule (circle → square →
+// star) by .github/workflows/rotate-help-shape.yml — keep the next line as a
+// single line so the workflow can sed-replace the value reliably.
+const HELP_BUTTON_SHAPE = "circle"; // one of: circle | square | star
+
+const HELP_BUTTON_SHAPE_STYLES: Record<
+  string,
+  { className: string; style?: React.CSSProperties }
+> = {
+  circle: { className: "rounded-full" },
+  square: { className: "rounded-md" },
+  star: {
+    className: "rounded-none",
+    style: {
+      clipPath:
+        "polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)",
+    },
+  },
+};
+
+const HELP_BUTTON_STYLE =
+  HELP_BUTTON_SHAPE_STYLES[HELP_BUTTON_SHAPE] ?? HELP_BUTTON_SHAPE_STYLES.circle;
+
 const NAME_STORAGE_KEY = "marcoPlayerName";
 
 type MathQuestion = { question: string; answer: number };
@@ -1425,7 +1448,8 @@ export default function App() {
       <button
         type="button"
         onClick={() => { setRulesTab("rules"); setShowRules(true); }}
-        className="fixed top-4 right-4 z-50 w-10 h-10 rounded-full bg-blue-500 text-white text-xl font-bold shadow-lg flex items-center justify-center hover:bg-blue-600 active:scale-95 transition-all"
+        className={`fixed top-4 right-4 z-50 w-10 h-10 ${HELP_BUTTON_STYLE.className} bg-blue-500 text-white text-xl font-bold shadow-lg flex items-center justify-center hover:bg-blue-600 active:scale-95 transition-all`}
+        style={HELP_BUTTON_STYLE.style}
         aria-label="Game rules"
       >
         ?
