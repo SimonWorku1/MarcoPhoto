@@ -59,7 +59,7 @@ type Role = "Marco" | "Reg";
 // Shape of the floating help (?) button. Cycled on a schedule (circle → square →
 // star) by .github/workflows/rotate-help-shape.yml — keep the next line as a
 // single line so the workflow can sed-replace the value reliably.
-const HELP_BUTTON_SHAPE = "star"; // one of: circle | square | star
+const HELP_BUTTON_SHAPE = "circle"; // one of: circle | square | star
 
 const HELP_BUTTON_SHAPE_STYLES: Record<
   string,
